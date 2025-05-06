@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "llm-granite-ft"
 version = "0.1.0"
 dependencies = [
-    "transformers",
+    "transformers[torch]",
     "peft",
     "bitsandbytes",
     "datasets",
@@ -14,9 +14,12 @@ dependencies = [
     "accelerate",
     "deepspeed",
     "evaluate",
-    "mlflow", # optional experiment tracking
+    "scipy",
+    "mlflow",
+    "psutil",
+    "pynvml",
 ]
-requires-python = ">=3.10" # Assuming Python 3.10 based on the base image pytorch:24.07-py3
+requires-python = ">=3.10"
 
 # Optional: Add other metadata if needed
 # description = "Fine-tuning Granite LLM"

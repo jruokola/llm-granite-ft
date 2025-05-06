@@ -5,6 +5,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 ENV UV_COMPILE_BYTECODE=1
 
+# Copy certificate into image
+# Adjust path relative to the Docker build context (llm-granite-ft/)
+COPY /mlflow-cert/ca.pem /etc/mlflow/certs/ca.pem
+
+# Set environment variable for MLflow client to find the cert
+ENV MLFLOW_TRACKING_SERVER_CERT_PATH=/etc/mlflow/certs/ca.pem
+
 # ----------  Python deps  ----------
 # Copy pyproject.toml to the current directory
 COPY pyproject.toml .
@@ -25,4 +32,4 @@ COPY . .
 # installing only dependencies is often sufficient.
 
 ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-CMD ["bash"]
+CMD ["python", "finetune.py"]
