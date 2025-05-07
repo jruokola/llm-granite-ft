@@ -3,8 +3,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1 # Evaluation typically needs one GPU
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G # Adjust based on model size and batch size for pipeline
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=180G # Adjust based on model size and batch size for pipeline
 #SBATCH --time=01:00:00
 #SBATCH --output=/root/granite_evaluate_%j.log
 #SBATCH --export=ALL
@@ -16,13 +16,13 @@ HOST_SHARED_FS_ROOT_PATH="/" # Example: if filestore is mounted at / on worker n
 # This is where the training job (submit_finetune.sbatch) saved its checkpoints/adapters.
 # You need to know the SLURM_JOB_ID of the training job to point to the correct adapters.
 # Example: /root/slurm_jobs_output/checkpoints/granite_fsdp_qlora_slurm_<TRAIN_JOB_ID>
-HOST_PATH_TO_TRAINED_ADAPTERS="${HOST_SHARED_FS_ROOT_PATH}/root/slurm_jobs_output/checkpoints/granite_fsdp_qlora_slurm_<REPLACE_WITH_TRAIN_JOB_ID>"
+HOST_PATH_TO_TRAINED_ADAPTERS="/root/slurm_jobs_output/checkpoints/granite_fsdp_qlora_slurm_<REPLACE_WITH_TRAIN_JOB_ID>"
 
 # Path on shared storage where evaluation results will be written by this job.
-HOST_PATH_FOR_EVAL_RESULTS="${HOST_SHARED_FS_ROOT_PATH}/root/slurm_jobs_output/eval_results/granite_eval_${SLURM_JOB_ID}"
+HOST_PATH_FOR_EVAL_RESULTS="/root/slurm_jobs_output/eval_results/granite_eval_${SLURM_JOB_ID}"
 
 # Path to the test data CSV on shared storage (if not using data from image)
-# HOST_PATH_TO_TEST_CSV="${HOST_SHARED_FS_ROOT_PATH}/root/data/test_extended.csv"
+# HOST_PATH_TO_TEST_CSV="/root/data/test_extended.csv"
 
 # --- Container Image (must be the same as used for training or compatible) ---
 CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-ft:latest"
