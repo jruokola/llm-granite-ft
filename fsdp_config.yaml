@@ -1,0 +1,23 @@
+# Basic Accelerate FSDP configuration
+compute_environment: LOCAL_MACHINE # Will be overridden by Slurm plugin or multi-GPU on single node
+# distributed_type: FSDP # Can also be set via CLI --fsdp
+# num_processes: auto # Accelerate will try to determine from env (e.g. WORLD_SIZE from Slurm)
+# mixed_precision: "bf16" # If using bfloat16, ensure hardware support
+
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP # Auto-wrap transformer blocks
+  fsdp_backward_prefetch: BACKWARD_PRE # Or BACKWARD_POST
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false # Set to true to offload parameters to CPU (reduces VRAM, slower)
+  fsdp_sharding_strategy: FULL_SHARD # Options: FULL_SHARD, SHARD_GRAD_OP, NO_SHARD, HYBRID_SHARD
+  fsdp_state_dict_type: SHARDED_STATE_DICT # For saving/loading sharded model checkpoints
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true # Recommended for PEFT/LoRA with FSDP
+  # fsdp_cpu_ram_efficient_loading: true # If loading very large models that don't fit on single GPU RAM
+
+machine_rank: 0 # Placeholder, Accelerate/torchrun usually handle this
+main_process_ip: null # Placeholder, Accelerate/torchrun usually handle this
+main_process_port: null # Placeholder, Accelerate/torchrun usually handle this
+main_training_function: main # If your script has a main function
+# num_machines: auto # Placeholder, Accelerate/torchrun usually handle this
+# use_cpu: false # Set to true for CPU only, for dry_run_cpu this is handled in script 

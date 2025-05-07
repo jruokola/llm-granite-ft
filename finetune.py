@@ -40,15 +40,80 @@ else:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- Argument Parser ----
-parser = argparse.ArgumentParser(description="Finetune a Granite model.")
+parser = argparse.ArgumentParser(
+    description="Finetune a Granite model with FSDP-QLoRA."
+)
 parser.add_argument(
     "--output_dir",
     type=str,
-    default="/checkpts/granite3.3-lora-default",
+    default="/job_outputs/checkpoints/granite_fsdp_qlora_default",
     help="Directory to save checkpoints and final model.",
 )
-# Add other arguments if needed, e.g., for data paths, model_id, etc.
-args = parser.parse_args()
+parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs.")
+parser.add_argument(
+    "--batches_per_epoch",
+    type=int,
+    default=0,
+    help="Limit batches per epoch for quick test (0 for all).",
+)
+parser.add_argument(
+    "--lr", type=float, default=0.0002, help="Learning rate."
+)  # Common for QLoRA
+parser.add_argument(
+    "--data_path_train",
+    type=str,
+    default="data/train_extended.csv",
+    help="Path to training CSV.",
+)
+parser.add_argument(
+    "--data_path_eval",
+    type=str,
+    default="data/test_extended.csv",
+    help="Path to evaluation CSV.",
+)
+parser.add_argument(
+    "--model_id",
+    type=str,
+    default="ibm-granite/granite-3.3-8b-instruct",
+    help="Base model ID from Hugging Face Hub.",
+)
+parser.add_argument(
+    "--seq_len", type=int, default=1024, help="Maximum sequence length."
+)
+parser.add_argument(
+    "--per_device_train_batch_size",
+    type=int,
+    default=4,
+    help="Batch size per device for training.",
+)
+parser.add_argument(
+    "--per_device_eval_batch_size",
+    type=int,
+    default=4,
+    help="Batch size per device for evaluation.",
+)
+parser.add_argument(
+    "--gradient_accumulation_steps",
+    type=int,
+    default=1,
+    help="Gradient accumulation steps.",
+)
+parser.add_argument("--logging_steps", type=int, default=5, help="Log every X steps.")
+parser.add_argument(
+    "--save_steps", type=int, default=500, help="Save checkpoint every X steps."
+)  # Or based on epochs
+parser.add_argument(
+    "--dry_run_cpu",
+    action="store_true",
+    help="Run a minimal test on CPU for 1 batch (for CI).",
+)
+parser.add_argument(
+    "--no_mlflow", action="store_true", help="Disable MLflow logging for this script."
+)
+# Add FSDP specific args if needed, or use an accelerate config file
+# parser.add_argument("--fsdp_config_path", type=str, default=None, help="Path to FSDP config file for Accelerate/Trainer.")
+
+cli_args = parser.parse_args()
 
 # ---- MLflow Setup ----
 # Only log from rank 0 process in distributed training
@@ -66,10 +131,10 @@ elif rank > 0:
     os.environ["MLFLOW_DISABLE"] = "TRUE"
     print(f"MLflow Autologging disabled for rank {rank}.")
 
-MODEL_ID = "ibm-granite/granite-3.3-8b-instruct"  # base model 8 B  [oai_citation:10‡huggingface.co](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct)
-TRAIN_CSV = "data/train_extended.csv"
-EVAL_CSV = "data/test_extended.csv"
-SEQ_LEN = 1024
+MODEL_ID = cli_args.model_id  # base model 8 B  [oai_citation:10‡huggingface.co](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct)
+TRAIN_CSV = cli_args.data_path_train
+EVAL_CSV = cli_args.data_path_eval
+SEQ_LEN = cli_args.seq_len
 
 # ---- 1.  load in 4-bit (QLoRA)  ----
 bnb_cfg = BitsAndBytesConfig(
@@ -138,11 +203,11 @@ ds = ds.map(fmt, remove_columns=ds["train"].column_names)
 # Define Training Arguments separately
 print(f"[Rank {rank if rank != -1 else 'N/A'}] Initializing TrainingArguments...")
 training_args_dict = {
-    "per_device_train_batch_size": 4,
-    "num_train_epochs": 5,
-    "learning_rate": 2e-4,
-    "logging_steps": 5,
-    "output_dir": args.output_dir,  # Use output_dir from command-line arguments
+    "per_device_train_batch_size": cli_args.per_device_train_batch_size,
+    "num_train_epochs": cli_args.epochs,
+    "learning_rate": cli_args.lr,
+    "logging_steps": cli_args.logging_steps,
+    "output_dir": cli_args.output_dir,  # Use output_dir from command-line arguments
     "report_to": "mlflow"
     if (rank == 0 or rank == -1)
     else "none",  # Report to mlflow only on rank 0
@@ -156,7 +221,9 @@ training_args_dict = {
 # For now, we are using explicit DDP wrapping.
 
 if world_size > 1:  # If distributed training
-    training_args_dict["gradient_accumulation_steps"] = 1  # Example, adjust as needed
+    training_args_dict["gradient_accumulation_steps"] = (
+        cli_args.gradient_accumulation_steps
+    )
     # Potentially adjust other DDP related args like ddp_find_unused_parameters if not wrapping manually
     # training_args_dict["ddp_find_unused_parameters"] = False
 
@@ -185,7 +252,7 @@ train_result = trainer.train()
 
 # Save the final model (adapter)
 if rank == 0 or rank == -1:
-    print(f"[Rank {rank}] Training finished. Saving model to {args.output_dir}")
+    print(f"[Rank {rank}] Training finished. Saving model to {cli_args.output_dir}")
     # When using DDP, the model to save is model.module to get the original underlying model
     model_to_save = model.module if hasattr(model, "module") else model
     trainer.model = model_to_save  # Temporarily set trainer.model to the unwrapped model for saving PEFT adapters

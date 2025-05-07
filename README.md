@@ -1,150 +1,142 @@
-# LLM Granite Fine-tuning with Slurm and Soperator on Nebius
+# LLM Granite Fine-tuning with FSDP-QLoRA (Slurm & Soperator on Nebius)
 
-This project fine-tunes an IBM Granite LLM (e.g., `ibm-granite/granite-3.3-8b-instruct`) using LoRA (Low-Rank Adaptation) for a custom instruction-following task. The fine-tuning process is orchestrated using Slurm managed by Soperator on a Nebius Kubernetes cluster.
+This project fine-tunes an IBM Granite LLM (e.g., `ibm-granite/granite-3.3-8b-instruct`) using FSDP-QLoRA for custom instruction-following tasks. The fine-tuning process is orchestrated using Slurm (managed by Soperator on a Nebius Kubernetes cluster) and Hugging Face Accelerate.
 
 ## Prerequisites
 
-1. **Nebius Kubernetes Cluster with Slurm/Soperator:** A functional Kubernetes cluster managed by Nebius with Slurm and Soperator installed and configured. This is typically set up by the `infra-nebius-slurm-poc` Terraform configuration.
+1. **Nebius Kubernetes Cluster with Slurm/Soperator:** A functional Kubernetes cluster by Nebius with Slurm and Soperator installed and configured. This is typically set up by the `infra-nebius-slurm-poc` Terraform configuration.
 2. **Nebius Filestore:** A Nebius Filestore instance mounted and accessible by the Slurm worker nodes. This will be used for:
-    * Storing training and evaluation datasets.
+    * (Optional) Storing training and evaluation datasets if not baked into the image.
     * Storing model checkpoints and final LoRA adapters.
-3. **Docker Registry:** A Docker container registry (e.g., Nebius Container Registry, Docker Hub) accessible from the Kubernetes cluster. This project's Docker image will be pushed here.
-4. **MLflow Tracking Server:** An MLflow Tracking Server instance for logging metrics, parameters, and artifacts. The MLflow CA certificate (`mlflow-cert/ca.pem`) must be present.
-5. **Python Environment & `uv`:** A local Python environment with `uv` installed for managing dependencies (`pip install uv`).
-6. **Nebius CLI & `kubectl`:** Configured for access to your Nebius resources and Kubernetes cluster.
-7. **Slurm Client Tools:** `sbatch`, `squeue`, `scancel`, `scontrol` configured to submit jobs to your Slurm/Soperator cluster.
+3. **Docker Registry:** A Docker container registry (e.g., Nebius Container Registry, Docker Hub, GHCR) accessible from the Kubernetes cluster. This project's Docker image will be pushed here.
+4. **MLflow Tracking Server:** An MLflow Tracking Server instance for logging. The MLflow CA certificate (`mlflow-cert/ca.pem`) is required if using TLS.
+5. **Local Environment:** Python and Docker installed for building the training image.
+6. **Nebius CLI & `kubectl`:** Configured for access to your Nebius resources and Kubernetes cluster (for debugging, `kubectl` is not strictly needed for job submission if Slurm is configured).
+7. **Slurm Client Tools:** `sbatch`, `squeue`, etc., configured on a Slurm login node to submit jobs to your Soperator-managed cluster.
 
 ## Project Structure
 
 ```
 llm-granite-ft/
-├── Dockerfile            # Defines the container image for training
-├── pyproject.toml        # Python project metadata and dependencies (used by uv)
-├── finetune.py           # Main Python script for fine-tuning the model
-├── evaluate.py           # (Optional) Script for evaluating the fine-tuned model
-├── submit_finetune.sbatch # Slurm batch submission script
-├── ds_config_zero3.json  # DeepSpeed Zero3 config (if using DeepSpeed)
-├── data/                   # Directory for training/evaluation data (if baked into image)
+├── Dockerfile                # Defines the container image for training
+├── pyproject.toml            # Python project metadata (can be used by uv or for reference)
+├── requirements.txt          # Python dependencies for pip
+├── finetune.py               # Main Python script for FSDP-QLoRA fine-tuning
+├── evaluate.py               # (Optional) Script for evaluating the fine-tuned model
+├── submit_finetune.sbatch    # Slurm batch submission script
+├── fsdp_config.yaml          # Hugging Face Accelerate config for FSDP
+├── data/                       # Directory for training/evaluation data (if baked into image)
 │   └── train_extended.csv
 │   └── test_extended.csv
-├── mlflow-cert/          # Directory containing MLflow CA certificate
+├── mlflow-cert/              # Directory containing MLflow CA certificate (if needed)
 │   └── ca.pem
-└── README.md             # This file
+└── README.md                 # This file
 ```
 
 ## Setup and Deployment Workflow
 
-### 1. Configure Environment Variables
+### 1. Configure Environment Variables (for sbatch script)
 
-Ensure the following environment variables are set in your shell or sourced from a script before interacting with MLflow or submitting Slurm jobs. The `submit_finetune.sbatch` script also sets some of these for the job environment.
-
-* `MLFLOW_TRACKING_URI`: URI of your MLflow tracking server.
-* `MLFLOW_TRACKING_SERVER_CERT_PATH`: Path to the MLflow CA certificate (used by the Python script if the path in the container differs from the one set in Dockerfile, but generally ENV in Dockerfile is sufficient).
-* `MLFLOW_TRACKING_USERNAME` (if MLflow is authenticated)
-* `MLFLOW_TRACKING_PASSWORD` (if MLflow is authenticated)
-* `MLFLOW_EXPERIMENT_NAME` (optional, defaults can be used)
+The `submit_finetune.sbatch` script sets necessary environment variables like `MLFLOW_TRACKING_URI` and `MLFLOW_TRACKING_SERVER_CERT_PATH` for the job environment. Ensure these are correct within the script if not using external environment configuration for the job.
 
 ### 2. Prepare Data
 
-* **Option A (Data in Image):** Place your `train_extended.csv` and `test_extended.csv` files into the `data/` directory. They will be copied into the Docker image.
-* **Option B (Data on Shared Filestore - Recommended for large datasets):**
-    1. Upload your `train_extended.csv` and `test_extended.csv` to a specific location on your Nebius Filestore.
-    2. Modify `finetune.py` to accept data paths as command-line arguments.
-    3. Update the `submit_finetune.sbatch` script to:
-        * Ensure the Nebius Filestore is mounted into the container (via Soperator's `--container-mounts` or equivalent).
-        * Pass the correct paths to your data on the mounted filestore to `finetune.py`.
+* **Option A (Data in Image - Default):** Place your `train_extended.csv` and `test_extended.csv` files into the `llm-granite-ft/data/` directory. The `Dockerfile` copies these into `/workspace/data/` inside the image, and `finetune.py` uses these paths by default.
+* **Option B (Data on Shared Filestore - Recommended for large datasets):
+    1. Upload your data to a specific location on your Nebius Filestore (e.g., `/path_on_filestore/my_data/`).
+    2. In `submit_finetune.sbatch`:
+        * Set `HOST_SHARED_FS_ROOT_PATH` to the mount point of your filestore on the worker nodes (e.g., `/` or `/mnt/shared_fs`).
+        * Uncomment and define `HOST_ACTUAL_DATA_PATH` to point to your data on the filestore (e.g., `${HOST_SHARED_FS_ROOT_PATH}/path_on_filestore/my_data`).
+        * Uncomment and define `CONTAINER_MOUNTED_DATA_DIR` (e.g., `/mounted_data_in_container`).
+        * Add the data mount to `CONTAINER_MOUNTS_ARG`: `CONTAINER_MOUNTS_ARG+=",${HOST_ACTUAL_DATA_PATH}:${CONTAINER_MOUNTED_DATA_DIR}"`.
+        * Update `DATA_TRAIN_ARG` and `DATA_EVAL_ARG` to use `CONTAINER_MOUNTED_DATA_DIR`.
 
 ### 3. Build and Push Docker Image
 
-1. Navigate to the `llm-granite-ft` directory.
+1. Navigate to the `llm-granite-ft` directory on your local machine.
 2. Build the Docker image:
 
     ```bash
-    docker build -t <your_registry>/llm-granite-ft:latest .
+    docker build -t <your_registry>/llm-granite-ft:<tag> .
     ```
 
+    (e.g., `docker build -t cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-ft:latest .`)
 3. Push the image to your registry:
 
     ```bash
-    docker push <your_registry>/llm-granite-ft:latest
+    docker push <your_registry>/llm-granite-ft:<tag>
     ```
-
-    Replace `<your_registry>` with your actual container registry path (e.g., `cr.eu-north1.nebius.cloud/your-registry-id`).
 
 ### 4. Configure Slurm Submission Script (`submit_finetune.sbatch`)
 
-Open `submit_finetune.sbatch` and critically review/update the following sections:
+This script must be placed on the Slurm login node or accessible shared storage.
 
-* **Resource Requests:** Adjust `#SBATCH` directives for `--nodes`, `--ntasks-per-node`, `--gres=gpu:...`, `--cpus-per-task`, `--mem`, and `--time` to match your desired scale and available resources.
-* **Soperator Directives (Very Important!):**
-  * `#SBATCH --container-image=...`: Ensure this points to the image you pushed.
-  * `#SBATCH --container-workdir=...`: Should likely be `/workspace` as per the Dockerfile.
-  * `#SBATCH --container-mounts=<HOST_PATH_TO_NEBIUS_FILESTORE_MOUNT>:/mnt/shared_storage`: **This is crucial.** Replace `<HOST_PATH_TO_NEBIUS_FILESTORE_MOUNT>` with the actual path on the Slurm worker nodes where your Nebius Filestore (used for `filestore_jail` in Terraform) is mounted. `/mnt/shared_storage` will be its path inside the job container. This mount is used for checkpoints and potentially for data.
-* **MLflow Environment Variables:** Verify `MLFLOW_TRACKING_URI` and other MLflow variables if they are hardcoded in the script.
-* **Checkpoint Directory:** The script creates `JOB_CHECKPOINT_DIR` based on the container mount. Ensure this logic aligns with your filestore structure.
-* **Data Paths (if using Option B for data):** Update `FINETUNE_ARGS` to pass the correct data paths to `finetune.py`.
-* **Launch Command:** The script currently uses `srun torchrun ...` for distributed training. This assumes `finetune.py` has been adapted for `torch.distributed` as discussed. If using DeepSpeed or another method, adjust the launch command accordingly.
+**Critically review and update these sections ON THE LOGIN NODE before submitting:**
 
-### 5. Submit the Fine-tuning Job to Slurm
+* **Resource Requests (`#SBATCH` directives):** Adjust `--nodes`, `--ntasks-per-node`, `--gres=gpu:...`, `--cpus-per-task`, `--mem`, `--time` to match your desired scale and cluster resources.
+* **`srun` options for Pyxis/Enroot:**
+  * `--container-image`: Ensure this points to the exact image URI you pushed (e.g., `docker://cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-ft:latest`).
+  * `--container-workdir`: Should be `/workspace` (aligns with Dockerfile).
+  * `--container-mounts`:
+    * The script constructs `CONTAINER_MOUNTS_ARG`. You **MUST** set the `HOST_SHARED_FS_ROOT_PATH` variable within the script to the correct absolute path where your Nebius Filestore is mounted on the Slurm worker nodes (e.g., `/` or `/mnt/filestore_on_host`).
+    * `HOST_JOB_OUTPUTS_BASE_PATH` (e.g., `/root/slurm_jobs_output` on the filestore) will be mapped to `CONTAINER_CHECKPOINT_DIR_BASE` (e.g., `/job_outputs`) inside the container.
+    * Ensure `HOST_JOB_OUTPUTS_BASE_PATH` exists on the shared filestore and is writable by the job user (`mkdir -p /root/slurm_jobs_output` on the login node if path is `/root/...` on filestore).
+* **MLflow Environment Variables:** Verify `MLFLOW_TRACKING_URI` and credentials if needed.
+* **`finetune.py` Arguments (`FINETUNE_CLI_ARGS`):** Adjust epochs, batch sizes, learning rate, etc., as needed.
 
-Once the `sbatch` script is configured and your data is in place:
+### 5. Configure Enroot Authentication (on Login/Worker Nodes)
+
+For pulling from a private Nebius Container Registry, Enroot (used by Pyxis) needs credentials. On the **login node** (and this configuration needs to be effective on worker nodes, possibly via shared home or Soperator-managed config):
+
+1. Create/edit `/root/.config/enroot/.credentials` (if jobs run as root).
+2. Add a line like: `machine cr.eu-north1.nebius.cloud login <KEY_ID> password <SECRET_KEY>`
+    * Replace `<KEY_ID>` and `<SECRET_KEY>` with your Nebius Service Account **Static Access Key ID and Secret** that has permission to pull from the registry.
+3. Set permissions: `chmod 600 /root/.config/enroot/.credentials`.
+
+### 6. Submit the Fine-tuning Job to Slurm
+
+From the Slurm login node:
 
 ```bash
-sbatch submit_finetune.sbatch
+sbatch /path/to/your/submit_finetune.sbatch
 ```
 
-### 6. Monitor the Job
+### 7. Monitor the Job
 
-* Check job status: `squeue -u $USER`
-* View job output log: `cat granite_ft_<job_id>.log` (or path specified in `--output`)
-* Inspect Slurm control daemon logs or Soperator logs if issues arise with job scheduling or pod creation.
-* Check MLflow UI for experiment tracking.
-* If Kubernetes pods are created by Soperator for the job, you can use `kubectl logs <pod_name> -n <namespace_soperator_uses>` for detailed container logs.
+* **Slurm:** `squeue -u $USER`, `scontrol show job <jobid>`, check output log specified in `sbatch` (e.g., `/root/granite_fsdp_qlora_<jobid>.log`).
+* **MLflow UI:** For parameters, metrics, and artifacts.
+* **Kubernetes (for Soperator debugging):** `kubectl get pods -A -l slurm.nebius.ai/job-id=<jobid>`, `kubectl logs <pod_name> -n <namespace>`. Pods are typically in the `soperator` or `default` namespace.
 
 ## Fine-tuning Script (`finetune.py`)
 
-The script `finetune.py` is responsible for:
+Now adapted for FSDP-QLoRA using Hugging Face Accelerate and Trainer:
 
-1. Loading the base IBM Granite model with 4-bit quantization (QLoRA).
-2. Attaching LoRA adapters.
-3. Loading the training and evaluation datasets.
-4. Formatting the dataset into prompt-completion pairs.
-5. Using Hugging Face `SFTTrainer` for fine-tuning.
-6. Logging metrics and parameters to MLflow via `mlflow.autolog()`.
-7. Saving the trained LoRA adapters to the specified output directory.
+* Uses `BitsAndBytesConfig` with `bnb_4bit_quant_storage` for FSDP compatibility.
+* Model loading uses `torch_dtype` matching the quant storage.
+* Manual DDP setup is removed.
+* `TrainingArguments` includes `fsdp` parameters (e.g., `fsdp="full_shard auto_wrap"`).
+* Launched via `accelerate launch` (called by `srun` in the sbatch script).
+* Handles various command-line arguments for configurability.
 
-**For Distributed Training (Multi-Node/Multi-GPU):**
-The script has been adapted to support PyTorch DistributedDataParallel (DDP):
+## Accelerate Configuration (`fsdp_config.yaml`)
 
-* Initializes `torch.distributed.init_process_group(backend='nccl', init_method='env://')`.
-* Determines `local_rank` from `os.environ["LOCAL_RANK"]` (set by `torchrun`).
-* Moves the model to the correct GPU and wraps it with `torch.nn.parallel.DistributedDataParallel`.
-* MLflow logging and model saving are performed only on `rank 0`.
-
-## Evaluation (`evaluate.py`)
-
-(Details to be added on how to use `evaluate.py` with the saved LoRA adapters, likely loading them onto the base model and running on a test set. This might also be run as a Slurm job.)
+A basic configuration file for Hugging Face Accelerate to enable FSDP with common strategies like `TRANSFORMER_BASED_WRAP` and `FULL_SHARD`.
 
 ## Dockerization (`Dockerfile`)
 
-The `Dockerfile`:
+* Uses `nvcr.io/nvidia/pytorch:24.07-py3` base image.
+* Installs dependencies from `requirements.txt` using `pip`.
+* Sets `WORKDIR /workspace` and `ENV PYTHONPATH="/app/src:${PYTHONPATH}"` (Corrected: should be `/workspace/src` if `src` is inside `llm-granite-ft` copied to `/workspace`, or just `/workspace` if `gpu_probe` package is directly in `/workspace`).
+  * **Note:** If your project structure is `llm-granite-ft/src/gpu_probe_package`, and `Dockerfile` is in `llm-granite-ft`, then `COPY . .` makes `src` appear at `/workspace/src`. So `PYTHONPATH` should be `/workspace` for `import src.gpu_probe_package` or if `finetune.py` is in `/workspace` and uses relative imports to `src`. If `finetune.py` is `/workspace/finetune.py` and tries `import data.utils`, then `PYTHONPATH` should include `/workspace`. For `-m module_name`, the parent of `module_name` dir must be on path. **Let's assume `finetune.py` is top-level in `/workspace` for now.** The `PYTHONPATH` in the current `Dockerfile` is `/app/src` from the `gpu-probe` edits; this will need to be `/workspace` if `finetune.py` and `evaluate.py` are directly in `/workspace`.
 
-* Starts from an NVIDIA PyTorch base image.
-* Installs `uv` for Python package management.
-* Copies the MLflow CA certificate into the image and sets `MLFLOW_TRACKING_SERVER_CERT_PATH`.
-* Uses `uv sync` to install dependencies from `pyproject.toml`.
-* Sets the `WORKDIR` to `/workspace` and copies the project code.
-* Sets `CMD ["python", "finetune.py"]` (though this `CMD` is typically overridden by the `srun` command in the `sbatch` script).
+## Evaluation (`evaluate.py`)
 
-## Contributing
-
-(Add guidelines if this is a shared project.)
+(To be detailed: how to load the FSDP-QLoRA trained adapters and run evaluation.)
 
 ## Troubleshooting
 
-* Ensure Slurm, Soperator, and Kubernetes are healthy.
-* Verify that the Nebius Filestore is correctly mounted on all Slurm worker nodes at the expected `<HOST_PATH_TO_NEBIUS_FILESTORE_MOUNT>`.
-* Check Soperator logs for issues translating Slurm jobs to Kubernetes pods.
-* Check container logs via `kubectl logs` if pods are created but failing.
-* Ensure the Docker image is accessible and contains all necessary dependencies and scripts.
-* Verify MLflow server is reachable and credentials/certificates are correct.
+* **Slurmctld Down (Login Node MOTD):** The `controller-0` pod in the `soperator` namespace (or equivalent) is not running or healthy. Check `kubectl describe pod controller-0 -n soperator` and its logs. Often due to insufficient resources on the controller node or PVC issues.
+* **Job PENDING with `Reason=PartitionConfig`:** Nodes are not correctly configured in the Slurm partition or `slurmd` is not registering. Check `sinfo`, `slurmctld` logs, and `slurmd` logs on worker pods.
+* **Image Pull Errors (e.g., 401 Unauthorized from `cr.eu-north1.nebius.cloud/v2/token/`):** Enroot authentication issue. Verify `/root/.config/enroot/.credentials` on the execution environment (login or worker nodes) uses the correct format and valid credentials (preferably SA Static Key) for Nebius Container Registry.
+* **Pyxis Errors (`couldn't start container`, `child failed`):** Can be due to failed image pull, incorrect `--container-mounts` (host path doesn't exist or permissions), or issues with the container image itself (entrypoint/cmd error, missing dependencies).
+* **`torchrun: command not found` or `ModuleNotFoundError: No module named 'torch'` in job log:** Indicates Python environment or `PATH` issues within the container when run by `srun`. Ensure your `Dockerfile` installs PyTorch correctly and that `accelerate launch` (or `python -m torch.distributed.run`) uses the correct Python environment. Explicitly setting `ENV PATH` in Dockerfile to include Python script directories (like `/usr/local/bin` or custom venv paths) can help.

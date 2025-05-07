@@ -1,0 +1,13 @@
+transformers
+torch # Or a specific version like torch>=2.0
+peft
+bitsandbytes
+datasets
+trl
+accelerate
+deePspeed
+evaluate
+scipy
+mlflow
+psutil
+pynvml 
