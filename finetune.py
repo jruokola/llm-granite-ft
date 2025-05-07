@@ -6,6 +6,9 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
 )
 from trl import (
     SFTTrainer,  # simpler SFT loop  [oai_citation:9‡discuss.huggingface.co](https://discuss.huggingface.co/t/when-to-use-sfttrainer/40998)
@@ -14,7 +17,16 @@ import argparse  # Added for command-line arguments
 import os  # For environment variables
 import torch  # For distributed training
 import torch.distributed as dist  # For distributed training
-# from torch.utils.data.distributed import DistributedSampler # May be needed if Trainer doesn't handle it
+
+try:
+    import pynvml
+
+    NVML_AVAILABLE = True
+except ImportError:
+    print(
+        "WARN: pynvml library not found. GPU utilization and memory metrics will not be logged by this script."
+    )
+    NVML_AVAILABLE = False
 
 # ---- Distributed Training Setup ----
 local_rank = -1
@@ -229,11 +241,6 @@ if world_size > 1:  # If distributed training
 
 training_args = TrainingArguments(**training_args_dict)
 
-# MLflow run context is managed by autolog triggered by trainer.train()
-# Removed: with mlflow.start_run():
-# Removed: manual mlflow.log_param calls
-# Removed: manual mlflow.log_artifact("ds_config_zero3.json") # Autolog might not capture this
-
 print(f"[Rank {rank if rank != -1 else 'N/A'}] Initializing SFTTrainer...")
 trainer = SFTTrainer(
     model=model,  # This is the DDP-wrapped model if distributed
@@ -273,3 +280,141 @@ if world_size > 1:
     dist.destroy_process_group()
 
 print(f"[Rank {rank if rank != -1 else 'N/A'}] Script finished.")
+
+
+class ShowcaseMetricsCallback(TrainerCallback):
+    def __init__(self, no_mlflow_arg=False):
+        super().__init__()
+        self.nvml_initialized = False
+        self.no_mlflow = no_mlflow_arg
+        if NVML_AVAILABLE:
+            try:
+                pynvml.nvmlInit()
+                self.nvml_initialized = True
+                print("[ShowcaseMetricsCallback] NVML Initialized.")
+            except Exception as e:
+                print(f"[ShowcaseMetricsCallback] WARN: Could not initialize NVML: {e}")
+
+    def _get_gpu_metrics(self, local_rank):
+        metrics = {}
+        if self.nvml_initialized and torch.cuda.is_available() and local_rank != -1:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                metrics["gpu_util_percent_snapshot"] = float(util.gpu)
+                metrics["vram_used_mib_snapshot"] = float(mem_info.used / (1024**2))
+                metrics["vram_total_mib_snapshot"] = float(mem_info.total / (1024**2))
+                if mem_info.total > 0:
+                    metrics["vram_percent_used_snapshot"] = float(
+                        (mem_info.used / mem_info.total) * 100
+                    )
+            except Exception as e:
+                print(
+                    f"[ShowcaseMetricsCallback] WARN: Could not log NVML metrics for device {local_rank}: {e}"
+                )
+        return metrics
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs=None,
+        **kwargs,
+    ):
+        if not state.is_world_process_zero or self.no_mlflow or not mlflow.active_run():
+            return
+
+        current_step = state.global_step
+        if logs is not None:
+            # Log GPU metrics snapshot
+            if torch.cuda.is_available():
+                # local_rank should be available via state.local_process_index or args.local_rank
+                local_rank_for_nvml = (
+                    state.local_process_index if state.local_process_index != -1 else 0
+                )
+                gpu_metrics = self._get_gpu_metrics(local_rank_for_nvml)
+                if gpu_metrics:
+                    mlflow.log_metrics(gpu_metrics, step=current_step)
+                    # print(f"[MetricsCallback Rank {state.process_index}] Logged GPU Snapshot at step {current_step}")
+
+            # Calculate and log Tokens/s if throughput info is available
+            # Trainer often logs 'train_samples_per_second' or 'throughput_samples_per_second'
+            # For SFTTrainer, packing might make exact token count per sample variable.
+            # We will rely on samples_per_second and multiply by sequence length as an approximation.
+            samples_per_second = logs.get(
+                "train_samples_per_second", None
+            )  # From Trainer
+            if samples_per_second is None:
+                samples_per_second = logs.get(
+                    "samples_per_second", None
+                )  # Sometimes just this
+
+            if (
+                samples_per_second is not None
+                and hasattr(args, "max_seq_length")
+                and args.max_seq_length is not None
+            ):
+                tokens_per_second_approx = samples_per_second * args.max_seq_length
+                mlflow.log_metric(
+                    "tokens_per_second_interval_approx",
+                    tokens_per_second_approx,
+                    step=current_step,
+                )
+                # print(f"[MetricsCallback Rank {state.process_index}] Logged Tokens/s (approx): {tokens_per_second_approx:.2f} at step {current_step}")
+
+    def on_train_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        # Ensure NVML shutdown happens for the master process that initialized it.
+        # Other ranks might not have initialized it if self.no_mlflow was true for them somehow or NVML_AVAILABLE was false.
+        if self.nvml_initialized and state.is_world_process_zero:
+            try:
+                pynvml.nvmlShutdown()
+                print("[ShowcaseMetricsCallback] NVML Shutdown on train end.")
+            except Exception as e:
+                print(f"[ShowcaseMetricsCallback] WARN: Error shutting down NVML: {e}")
+
+        if not state.is_world_process_zero or self.no_mlflow or not mlflow.active_run():
+            return
+
+        if torch.cuda.is_available():
+            local_rank_for_nvml = (
+                state.local_process_index if state.local_process_index != -1 else 0
+            )
+            gpu_metrics = self._get_gpu_metrics(local_rank_for_nvml)
+            if gpu_metrics:
+                final_gpu_metrics = {f"final_{k}": v for k, v in gpu_metrics.items()}
+                mlflow.log_metrics(final_gpu_metrics, step=state.global_step)
+
+        final_metrics = next(
+            (
+                l
+                for l in reversed(state.log_history)
+                if l.get("train_runtime") is not None
+                and l.get("train_samples_per_second") is not None
+            ),
+            None,
+        )
+        if (
+            final_metrics
+            and hasattr(args, "max_seq_length")
+            and args.max_seq_length is not None
+        ):
+            overall_samples_per_second = final_metrics["train_samples_per_second"]
+            overall_tokens_per_second_approx = (
+                overall_samples_per_second * args.max_seq_length
+            )
+            mlflow.log_metric(
+                "overall_avg_tokens_per_second_approx",
+                overall_tokens_per_second_approx,
+                step=state.global_step,
+            )
+            print(
+                f"[ShowcaseMetricsCallback Rank {state.process_index}] Logged Overall Avg Tokens/s (approx): {overall_tokens_per_second_approx:.2f}"
+            )
