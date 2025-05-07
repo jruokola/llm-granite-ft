@@ -78,3 +78,8 @@ mlruns/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# SA stuff
+/registry-sa
+iac-sa-key-2.json
+registry-tests-ketX.sh
