@@ -1,0 +1,26 @@
+FROM nvcr.io/nvidia/pytorch:24.07-py3
+
+# Set working directory
+WORKDIR /workspace
+
+# Install minimal dependencies for chess-finetune.py
+# transformers is needed for AutoModel/Tokenizer
+# datasets is needed for torch.utils.data components used in JsonlDataset
+RUN pip install --no-cache-dir transformers>=4.41.0 datasets>=2.19.0
+
+# Copy the training script and the dataset
+# Adjust path if strategic_game_chess.jsonl is elsewhere
+COPY chess-finetune.py .
+COPY strategic_game_chess.jsonl .
+
+# Optional: Add entrypoint or default CMD
+# Since this is typically launched via torchrun in sbatch, 
+# a CMD might not be strictly necessary, but can be useful for testing.
+# CMD ["python", "chess-finetune.py"] 
+# Or leave it empty if srun/torchrun always specifies the script.
+
+ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+
+# Add a simple diagnostic step
+RUN echo "--- Checking key libraries post-install ---" && \
+    pip show torch torchvision transformers datasets || echo "Pip show failed for some packages" 
