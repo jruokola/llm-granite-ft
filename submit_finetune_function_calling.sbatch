@@ -37,16 +37,17 @@ chmod -R 777 "${JOB_DIR}"  # Ensure permissions
 
 # Container paths
 CONTAINER_JOB_DIR="/job_data"
-CONTAINER_DATA_PATH="/workspace/function_calling.jsonl"
 
 # Container mounts
 CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
 
-# Training arguments - add precision overrides
+# Training arguments
 FINETUNE_CLI_ARGS=""
 FINETUNE_CLI_ARGS+=" --output_dir=${CONTAINER_JOB_DIR}/checkpoints"
-FINETUNE_CLI_ARGS+=" --data_path=${CONTAINER_DATA_PATH}"
 FINETUNE_CLI_ARGS+=" --disable_amp"  # Pass as a flag
+FINETUNE_CLI_ARGS+=" --num_epochs=1" # Set to 1 epoch
+FINETUNE_CLI_ARGS+=" --dataset_subset_size=10000" # Limit dataset size for testing
+FINETUNE_CLI_ARGS+=" --model_name_or_path=ibm-granite/granite-3.3-2b-instruct" # Correct model name format
 
 # Node and rank configuration
 HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
@@ -149,82 +150,53 @@ export PYTHONUNBUFFERED=1
 log \"Starting PyTorch distributed training with direct Python execution\"
 log \"ENV: RANK=\${RANK}, LOCAL_RANK=\${LOCAL_RANK}, WORLD_SIZE=\${WORLD_SIZE}\"
 
-# Create a patched version of the training script using sed commands
-log \"Creating patched version of training script...\"
+log \"DEBUG: FINETUNE_CLI_ARGS before python call: $FINETUNE_CLI_ARGS\"
 
-# Copy the original script to a new location
-cp /workspace/function-finetune.py /tmp/patched_function-finetune.py
-
-# Apply patches using sed
-# 1. Fix CUDA device selection
-sed -i 's/torch.cuda.set_device(torch.distributed.get_rank())/torch.cuda.set_device(int(os.environ.get(\"LOCAL_RANK\", 0)))/g' /tmp/patched_function-finetune.py
-log \"Patched: CUDA device selection\"
-
-# 2. Add import contextlib if needed
-grep -q 'import contextlib' /tmp/patched_function-finetune.py || sed -i 's/import torch/import torch\\nimport contextlib/g' /tmp/patched_function-finetune.py
-log \"Patched: Added contextlib import if needed\"
-
-# 3. Add disable_amp argument - using a simpler approach
-# Create a separate python script to add the argument
-cat > /tmp/add_arg.py << EOF
+# Create a more comprehensive patch script to fix the CUDA device assignment
+cat > /tmp/patch_script.py << 'EOF'
 import re
+import sys
 
-with open('/tmp/patched_function-finetune.py', 'r') as f:
+# Path to the script to patch
+script_path = '/workspace/function-finetune.py'
+
+with open(script_path, 'r') as f:
     content = f.read()
 
-# Check if the argument already exists
-if '--disable_amp' not in content:
-    # Find the line where ArgumentParser is created
-    match = re.search(r'parser\\s*=\\s*argparse\\.ArgumentParser\\(.*?\\)', content)
-    if match:
-        # Get the next line to determine indentation
-        next_line_match = re.search('\\n(\\s*)', content[match.end():])
-        if next_line_match:
-            indent = next_line_match.group(1)
-            # Insert right after the ArgumentParser line
-            pos = match.end()
-            content = content[:pos] + '\\n' + indent + 'parser.add_argument(\"--disable_amp\", action=\"store_true\", help=\"Disable automatic mixed precision\")' + content[pos:]
-            with open('/tmp/patched_function-finetune.py', 'w') as f:
-                f.write(content)
-            print('Added --disable_amp argument to the script')
-        else:
-            print('Could not determine indentation')
-    else:
-        print('Could not find ArgumentParser line')
+# Check if the problematic pattern exists and fix CUDA device assignment
+if 'torch.cuda.set_device(torch.distributed.get_rank())' in content:
+    # Replace the problematic line with one that uses os.environ to get LOCAL_RANK
+    patched_content = content.replace(
+        'torch.cuda.set_device(torch.distributed.get_rank())',
+        'local_rank = int(os.environ.get(\"LOCAL_RANK\", 0))\ntorch.cuda.set_device(local_rank)'
+    )
+    
+    # Write the patched content back
+    with open(script_path, 'w') as f:
+        f.write(patched_content)
+    
+    print(f'Patched {script_path}: Fixed CUDA device assignment with proper local_rank definition')
+# Check for the buggy patch we might have applied earlier
+elif 'torch.cuda.set_device(local_rank)' in content and 'local_rank = ' not in content:
+    # Add local_rank definition before the problematic line
+    pattern = r'(torch\.cuda\.set_device\(local_rank\))'
+    replacement = r'local_rank = int(os.environ.get(\"LOCAL_RANK\", 0))\n\1'
+    patched_content = re.sub(pattern, replacement, content)
+    
+    # Write the patched content back
+    with open(script_path, 'w') as f:
+        f.write(patched_content)
+    
+    print(f'Patched {script_path}: Added missing local_rank definition')
 else:
-    print('--disable_amp argument already exists')
+    print(f'No patching needed for {script_path} or already contains correct local_rank definition')
 EOF
 
-python /tmp/add_arg.py
-log \"Patched: Added disable_amp argument using Python script\"
+# Run the patch script
+python /tmp/patch_script.py
 
-# Show a section of the patched file to verify
-cat /tmp/patched_function-finetune.py | grep -A 10 -B 3 'ArgumentParser'
-log \"DEBUG: Showing argparse section of patched file (above)\"
-
-# 4. Modify scaler creation
-sed -i 's/scaler = GradScaler()/scaler = GradScaler() if not args.disable_amp else None/g' /tmp/patched_function-finetune.py
-log \"Patched: Modified GradScaler creation\"
-
-# 5. Modify autocast usage
-sed -i 's/with autocast(device_type=\"cuda\", dtype=torch.bfloat16):/with autocast(device_type=\"cuda\", dtype=torch.bfloat16) if not args.disable_amp else contextlib.nullcontext():/g' /tmp/patched_function-finetune.py
-log \"Patched: Modified autocast usage\"
-
-# 6. Fix scaler.scale calls
-sed -i 's/scaler.scale(loss).backward()/loss.backward() if args.disable_amp else scaler.scale(loss).backward()/g' /tmp/patched_function-finetune.py
-log \"Patched: Modified backward pass\"
-
-sed -i 's/scaler.step(optimizer)/optimizer.step() if args.disable_amp else scaler.step(optimizer)/g' /tmp/patched_function-finetune.py
-log \"Patched: Modified optimizer step\"
-
-sed -i 's/scaler.update()/scaler.update() if not args.disable_amp else None/g' /tmp/patched_function-finetune.py
-log \"Patched: Modified scaler update\"
-
-log \"Patching complete - running training script\"
-
-log \"DEBUG: FINETUNE_CLI_ARGS before python call: $FINETUNE_CLI_ARGS\"
-# Run the patched script
-python /tmp/patched_function-finetune.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
+# Run the training script
+python /workspace/function-finetune.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
 PYTHON_EXIT_CODE=\$?
 
 log \"Python process exited with code: \${PYTHON_EXIT_CODE}\"

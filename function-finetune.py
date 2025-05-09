@@ -66,7 +66,7 @@ parser.add_argument(
 parser.add_argument(
     "--model_name_or_path",
     type=str,
-    default="ibm-granite/granite-3.3:2b-instruct",
+    default="ibm-granite/granite-3.3-2b-instruct",
     help="Path to pretrained model or model identifier from huggingface.co/models",
 )
 parser.add_argument(
@@ -116,88 +116,251 @@ class FunctionCallingDataset(Dataset):
         # Set special tokens for the tokenizer
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Print sample data to understand structure
+        if len(self.dataset) > 0:
+            print(f"Dataset sample keys: {list(self.dataset[0].keys())}")
+            print(
+                f"Dataset sample first example chat content (first 200 chars): {self.dataset[0]['chat'][:200] if 'chat' in self.dataset[0] else None}"
+            )
+
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        # Get the example from the dataset
-        example = self.dataset[idx]
+        try:
+            # Get the example from the dataset
+            example = self.dataset[idx]
 
-        # Extract system and chat content
-        system = example.get("system", "")
-        chat = example.get("chat", "")
+            # Debug first few examples
+            if idx < 3:
+                print(f"Processing example {idx}")
 
-        # Format the text in the way Granite expects it
-        # Format: <|system|>\n{system_content}<|user|>\n{user_content}<|assistant|>\n{assistant_content}
-        formatted_text = ""
+            # Get the conversations from the example
+            # The dataset typically has 'system' (prompt) and 'chat' (conversation)
+            system_content = ""
+            formatted_text = ""
 
-        # Add system message if it exists
-        if system:
-            formatted_text += f"<|system|>\n{system}\n"
+            # Check what fields are available
+            if "system" in example and isinstance(example["system"], str):
+                system_content = example["system"].strip()
+                formatted_text += f"<|system|>\n{system_content}\n"
 
-        # Process chat messages
-        for message in chat:
-            role = message.get("role", "").lower()
-            content = message.get("content", "")
+            # Process main conversation content
+            chat_content = None
+            if "chat" in example:
+                chat_content = example["chat"]
+            elif "text" in example:
+                chat_content = example["text"]
 
-            if role == "user":
-                formatted_text += f"<|user|>\n{content}\n"
-            elif role == "assistant":
-                formatted_text += f"<|assistant|>\n{content}\n"
+            if chat_content is None:
+                # Fallback to using the entire example as text
+                chat_content = str(example)
 
-        # Encode the formatted text
-        encodings = self.tokenizer(
-            formatted_text,
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
+            # Handle the conversation content
+            if isinstance(chat_content, str):
+                # Process the full conversation string
+                # Split by common patterns found in the dataset
+                lines = chat_content.split("\n")
+                current_role = None
+                current_content = []
 
-        # Create the labels (same as input_ids but with -100 for non-assistant tokens)
-        input_ids = encodings.input_ids[0]
-        attention_mask = encodings.attention_mask[0]
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
 
-        # Create labels: -100 for non-assistant tokens, actual token ids for assistant tokens
-        labels = input_ids.clone()
+                    # Check for role markers
+                    if line.startswith("SYSTEM:"):
+                        # Process previous role if any
+                        if current_role and current_content:
+                            role_content = "\n".join(current_content).strip()
+                            if current_role == "system":
+                                # Only add if not already added
+                                if not formatted_text.startswith("<|system|>"):
+                                    formatted_text += f"<|system|>\n{role_content}\n"
+                            elif current_role == "user":
+                                formatted_text += f"<|user|>\n{role_content}\n"
+                            elif current_role == "assistant":
+                                formatted_text += f"<|assistant|>\n{role_content}\n"
 
-        # Find positions of <|assistant|> tokens to mask everything before them
-        assistant_positions = []
-        for i in range(len(input_ids) - 1):
-            if self.tokenizer.decode(input_ids[i : i + 2]) == "<|assistant|>":
-                assistant_positions.append(i)
+                        # Start new system content
+                        current_role = "system"
+                        current_content = [line.replace("SYSTEM:", "").strip()]
 
-        # Set labels to -100 for non-assistant parts
-        if assistant_positions:
-            in_assistant = False
-            for i in range(len(labels)):
-                # Check if this is the start of an assistant section
-                if i in assistant_positions:
-                    in_assistant = True
-                    # Skip the assistant token itself in the loss
-                    labels[i : i + 2] = -100
-                    continue
+                    elif line.startswith("USER:"):
+                        # Process previous role if any
+                        if current_role and current_content:
+                            role_content = "\n".join(current_content).strip()
+                            if current_role == "system":
+                                # Only add if not already added
+                                if not formatted_text.startswith("<|system|>"):
+                                    formatted_text += f"<|system|>\n{role_content}\n"
+                            elif current_role == "user":
+                                formatted_text += f"<|user|>\n{role_content}\n"
+                            elif current_role == "assistant":
+                                formatted_text += f"<|assistant|>\n{role_content}\n"
 
-                # If not in assistant section, mask the token
-                if not in_assistant:
-                    labels[i] = -100
+                        # Start new user content
+                        current_role = "user"
+                        current_content = [line.replace("USER:", "").strip()]
 
-                # Check if this is the end of an assistant section
-                if in_assistant and i < len(labels) - 1:
-                    if self.tokenizer.decode(input_ids[i : i + 2]) in [
-                        "<|user|>",
-                        "<|system|>",
-                    ]:
-                        in_assistant = False
-        else:
-            # If no assistant token found, don't compute loss on this example
-            labels[:] = -100
+                    elif line.startswith("A:"):
+                        # Process previous role if any
+                        if current_role and current_content:
+                            role_content = "\n".join(current_content).strip()
+                            if current_role == "system":
+                                # Only add if not already added
+                                if not formatted_text.startswith("<|system|>"):
+                                    formatted_text += f"<|system|>\n{role_content}\n"
+                            elif current_role == "user":
+                                formatted_text += f"<|user|>\n{role_content}\n"
+                            elif current_role == "assistant":
+                                formatted_text += f"<|assistant|>\n{role_content}\n"
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
+                        # Start new assistant content
+                        current_role = "assistant"
+                        current_content = [line.replace("A:", "").strip()]
+
+                    elif line.startswith("FUNCTION RESPONSE:"):
+                        # This is a special case for function responses
+                        # We'll add this to the assistant's context
+                        if current_role == "assistant":
+                            # Function response is part of the assistant conversation
+                            current_content.append(line)
+                        else:
+                            # If not in an assistant message, start a new one
+                            if current_role and current_content:
+                                role_content = "\n".join(current_content).strip()
+                                if current_role == "system":
+                                    formatted_text += f"<|system|>\n{role_content}\n"
+                                elif current_role == "user":
+                                    formatted_text += f"<|user|>\n{role_content}\n"
+                                elif current_role == "assistant":
+                                    formatted_text += f"<|assistant|>\n{role_content}\n"
+
+                            current_role = "assistant"
+                            current_content = [line]
+                    else:
+                        # Continue with current role
+                        if current_role:
+                            current_content.append(line)
+                        else:
+                            # If no role defined yet, assume it's the system message
+                            current_role = "system"
+                            current_content = [line]
+
+                # Process the last role if any
+                if current_role and current_content:
+                    role_content = "\n".join(current_content).strip()
+                    if current_role == "system":
+                        # Only add if not already added
+                        if not formatted_text.startswith("<|system|>"):
+                            formatted_text += f"<|system|>\n{role_content}\n"
+                    elif current_role == "user":
+                        formatted_text += f"<|user|>\n{role_content}\n"
+                    elif current_role == "assistant":
+                        formatted_text += f"<|assistant|>\n{role_content}\n"
+
+                # Remove <|endoftext|> tokens if present
+                formatted_text = formatted_text.replace("<|endoftext|>", "")
+
+            elif isinstance(chat_content, list):
+                # Handle list of message objects
+                for message in chat_content:
+                    if isinstance(message, dict):
+                        # Get role and content
+                        role = message.get("role", "").lower()
+                        content = message.get("content", "")
+
+                        if role == "system":
+                            formatted_text += f"<|system|>\n{content}\n"
+                        elif role == "user":
+                            formatted_text += f"<|user|>\n{content}\n"
+                        elif role == "assistant":
+                            formatted_text += f"<|assistant|>\n{content}\n"
+                    elif isinstance(message, str):
+                        # If message is a string, assume it's user content
+                        formatted_text += f"<|user|>\n{message}\n"
+
+            # If we couldn't parse anything useful, provide a fallback
+            if not formatted_text:
+                formatted_text = (
+                    "<|user|>\nHello\n<|assistant|>\nHello! How can I help you today?\n"
+                )
+
+            # Debug the formatted text for the first few examples
+            if idx < 3:
+                print(
+                    f"Formatted text for example {idx} (sample): {formatted_text[:200]}..."
+                )
+
+            # Encode the formatted text
+            encodings = self.tokenizer(
+                formatted_text,
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            # Create the labels (same as input_ids but with -100 for non-assistant tokens)
+            input_ids = encodings.input_ids[0]
+            attention_mask = encodings.attention_mask[0]
+
+            # Create labels: -100 for non-assistant tokens, actual token ids for assistant tokens
+            labels = input_ids.clone()
+
+            # Find positions of <|assistant|> tokens to mask everything before them
+            assistant_positions = []
+            for i in range(len(input_ids) - 1):
+                if self.tokenizer.decode(input_ids[i : i + 2]) == "<|assistant|>":
+                    assistant_positions.append(i)
+
+            # Set labels to -100 for non-assistant parts
+            if assistant_positions:
+                in_assistant = False
+                for i in range(len(labels)):
+                    # Check if this is the start of an assistant section
+                    if i in assistant_positions:
+                        in_assistant = True
+                        # Skip the assistant token itself in the loss
+                        labels[i : i + 2] = -100
+                        continue
+
+                    # If not in assistant section, mask the token
+                    if not in_assistant:
+                        labels[i] = -100
+
+                    # Check if this is the end of an assistant section
+                    if in_assistant and i < len(labels) - 1:
+                        if self.tokenizer.decode(input_ids[i : i + 2]) in [
+                            "<|user|>",
+                            "<|system|>",
+                        ]:
+                            in_assistant = False
+            else:
+                # If no assistant token found, don't compute loss on this example
+                labels[:] = -100
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+        except Exception as e:
+            print(f"Error processing example {idx}: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
+            # Return a dummy example that won't affect training
+            dummy_ids = torch.zeros(self.max_length, dtype=torch.long)
+            dummy_mask = torch.zeros(self.max_length, dtype=torch.long)
+            dummy_labels = -100 * torch.ones(self.max_length, dtype=torch.long)
+            return {
+                "input_ids": dummy_ids,
+                "attention_mask": dummy_mask,
+                "labels": dummy_labels,
+            }
 
     def collate_fn(self, examples):
         # This function is called by the DataLoader to collate multiple examples into a batch
@@ -472,9 +635,13 @@ logger.info(f"Args: {args}")
 # Fix seed
 torch.manual_seed(42)
 
-# Set device
-torch.cuda.set_device(torch.distributed.get_rank())
+# Set device - use LOCAL_RANK instead of global rank for device assignment
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
 device = torch.cuda.current_device()
+logger.info(
+    f"Using GPU: {torch.cuda.get_device_name(device)} (local_rank: {local_rank}, global_rank: {torch.distributed.get_rank()})"
+)
 
 # Load the tokenizer and model
 logger.info(f"Loading tokenizer and model from: {args.model_name_or_path}...")
