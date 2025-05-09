@@ -6,6 +6,7 @@ import logging
 import math
 import time
 import functools
+import os
 
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -53,8 +54,20 @@ parser.add_argument(
 parser.add_argument(
     "--data_path",
     type=str,
-    default="strategic_game_chess.jsonl",  # Default to the original file
+    default="strategic_game_chess.jsonl",
     help="Path to the JSONL dataset file.",
+)
+parser.add_argument(
+    "--output_dir",
+    type=str,
+    default="./chess_finetune_output",
+    help="Directory to save checkpoints and logs.",
+)
+parser.add_argument(
+    "--model_name_or_path",
+    type=str,
+    default="codellama/CodeLlama-7b-hf",
+    help="Path to pretrained model or model identifier from huggingface.co/models",
 )
 args = parser.parse_args()
 
@@ -179,6 +192,13 @@ def train(model, dataset, args):
 
         torch.cuda.empty_cache()
 
+    # Create output directory if it doesn't exist (only on rank 0)
+    if torch.distributed.get_rank() == 0 and args.output_dir:
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir, exist_ok=True)
+        logger.info(f"Output directory set to: {args.output_dir}")
+        # Future checkpoint saving logic would go here
+
 
 # Make sure to initialize distributed training (e.g., by using torch.distributed.launch)
 torch.distributed.init_process_group(backend="nccl")
@@ -197,12 +217,12 @@ logger.info(f"Args: {args}")
 torch.random.manual_seed(42)
 
 # Load the tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained(
-    "codellama/CodeLlama-7b-hf", cache_dir=".cache"
-)
+logger.info(f"Loading tokenizer and model from: {args.model_name_or_path}...")
+tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, cache_dir=".cache")
 model = AutoModelForCausalLM.from_pretrained(
-    "codellama/CodeLlama-7b-hf", cache_dir=".cache"
+    args.model_name_or_path, cache_dir=".cache"
 )
+logger.info("Tokenizer and model loaded.")
 logger.info(model)
 
 torch.cuda.set_device(torch.distributed.get_rank())
