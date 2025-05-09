@@ -11,7 +11,6 @@ import os
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from torch.cuda.amp import autocast, GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
@@ -43,7 +42,10 @@ parser.add_argument(
     "--max_training_steps", type=int, default=-1, help="Interrupt training early."
 )
 parser.add_argument(
-    "--gradient_checkpointing", action="store_true", help="Use gradient checkpointing"
+    "--gradient_checkpointing",
+    action="store_true",
+    default=True,
+    help="Use gradient checkpointing (default: True)",
 )
 parser.add_argument(
     "--max_seq_length",
@@ -145,7 +147,7 @@ def train(model, dataset, args):
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
     # AMP Setup
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler("cuda")
 
     # For demonstration purposes only: Print nvidia-smi GPU interface
     logger.info(subprocess.check_output(["nvidia-smi"]).decode("utf-8"))
@@ -162,7 +164,7 @@ def train(model, dataset, args):
         batch = {k: v.to(device) for k, v in batch.items()}
 
         # AMP autocast
-        with autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             outputs = model(**batch, use_cache=False)
             loss = outputs.loss / args.gradient_accumulation_steps
 
@@ -220,7 +222,7 @@ torch.random.manual_seed(42)
 logger.info(f"Loading tokenizer and model from: {args.model_name_or_path}...")
 tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, cache_dir=".cache")
 model = AutoModelForCausalLM.from_pretrained(
-    args.model_name_or_path, cache_dir=".cache"
+    args.model_name_or_path, cache_dir=".cache", torch_dtype=torch.bfloat16
 )
 logger.info("Tokenizer and model loaded.")
 logger.info(model)
