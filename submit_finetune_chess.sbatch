@@ -46,16 +46,16 @@ CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
 FINETUNE_CLI_ARGS=""
 FINETUNE_CLI_ARGS+=" --output_dir=${CONTAINER_JOB_DIR}/checkpoints"
 FINETUNE_CLI_ARGS+=" --data_path=${CONTAINER_DATA_PATH}"
-FINETUNE_CLI_ARGS+=" --disable_amp=True"  # Add parameter to disable automatic mixed precision
+FINETUNE_CLI_ARGS+=" --disable_amp"  # Pass as a flag
 
 # Node and rank configuration
-HEAD_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-HEAD_NODE_IP=$(getent hosts ${HEAD_NODE} | awk '{print $1}' | head -n 1)
+HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+HEAD_NODE_IP=$(getent hosts "${HEAD_NODE}" | awk '{print $1}' | head -n 1)
 MASTER_PORT=29510
 
 echo "Head node: ${HEAD_NODE} (${HEAD_NODE_IP}:${MASTER_PORT})"
 echo "Container mounts: ${CONTAINER_MOUNTS}"
-echo "Finetune CLI args: ${FINETUNE_CLI_ARGS}"
+echo "Finetune CLI args: $FINETUNE_CLI_ARGS"
 
 # Write configuration files for nodes to read
 echo "${HEAD_NODE}" > "${COORD_DIR}/master_addr.txt"
@@ -64,7 +64,8 @@ echo "${MASTER_PORT}" > "${COORD_DIR}/master_port.txt"
 echo "${SLURM_NNODES}" > "${COORD_DIR}/world_size.txt"
 
 # Create node rank mapping
-ALL_NODES=($(scontrol show hostnames $SLURM_JOB_NODELIST))
+# Use read to properly handle command output
+mapfile -t ALL_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 for i in "${!ALL_NODES[@]}"; do
     echo "${ALL_NODES[$i]}: $i" >> "${COORD_DIR}/node_ranks.txt"
     echo "Node ${i}: ${ALL_NODES[$i]}"
@@ -80,171 +81,155 @@ echo "============================================================"
 
 srun \
     --export=ALL,PYTORCH_CUDA_ALLOC_CONF,TORCH_DISTRIBUTED_TIMEOUT \
-    --container-image=${CONTAINER_IMAGE} \
-    --container-workdir=/workspace \
-    --container-mounts=${CONTAINER_MOUNTS} \
-    sh -c '
+    --container-image="${CONTAINER_IMAGE}" \
+    --container-workdir="/workspace" \
+    --container-mounts="${CONTAINER_MOUNTS}" \
+    sh -c "
 # Get node information
-NODE_HOSTNAME=$(hostname)
-NODE_LOG_FILE="/job_data/logs/${NODE_HOSTNAME}.log"
+NODE_HOSTNAME=\$(hostname)
+NODE_LOG_FILE=\"/job_data/logs/\${NODE_HOSTNAME}.log\"
 
 # Use simple redirection compatible with dash shell
-echo "==================== Node: ${NODE_HOSTNAME} ====================" | tee "$NODE_LOG_FILE"
-date | tee -a "$NODE_LOG_FILE"
+echo \"==================== Node: \${NODE_HOSTNAME} ====================\" | tee \"\$NODE_LOG_FILE\"
+date | tee -a \"\$NODE_LOG_FILE\"
 
 # Define a simple logging function
 log() {
-  echo "$@" | tee -a "$NODE_LOG_FILE"
+  echo \"\$@\" | tee -a \"\$NODE_LOG_FILE\"
 }
 
 # Read configuration
-MASTER_ADDR=$(cat /job_data/coord/master_ip.txt)
-MASTER_PORT=$(cat /job_data/coord/master_port.txt)
-WORLD_SIZE=$(cat /job_data/coord/world_size.txt)
+MASTER_ADDR=\$(cat /job_data/coord/master_ip.txt)
+MASTER_PORT=\$(cat /job_data/coord/master_port.txt)
+WORLD_SIZE=\$(cat /job_data/coord/world_size.txt)
 
 # Find node rank
-NODE_RANK=""
-while IFS=": " read -r host rank; do
-    if [ "$host" = "$NODE_HOSTNAME" ]; then
-        NODE_RANK=$rank
+NODE_RANK=\"\"
+while IFS=\": \" read -r host rank; do
+    if [ \"\$host\" = \"\$NODE_HOSTNAME\" ]; then
+        NODE_RANK=\$rank
         break
     fi
-done < "/job_data/coord/node_ranks.txt"
+done < \"/job_data/coord/node_ranks.txt\"
 
-if [ -z "$NODE_RANK" ]; then
-    log "ERROR: Could not determine rank for node ${NODE_HOSTNAME}"
-    cat "/job_data/coord/node_ranks.txt" | tee -a "$NODE_LOG_FILE"
+if [ -z \"\$NODE_RANK\" ]; then
+    log \"ERROR: Could not determine rank for node \${NODE_HOSTNAME}\"
+    cat \"/job_data/coord/node_ranks.txt\" | tee -a \"\$NODE_LOG_FILE\"
     exit 1
 fi
 
 # Always ensure LOCAL_RANK is 0 as we have 1 GPU per node
 LOCAL_RANK=0
 
-log "This node: ${NODE_HOSTNAME}, Global Rank: ${NODE_RANK}, Local Rank: ${LOCAL_RANK}"
-log "Master: ${MASTER_ADDR}:${MASTER_PORT}, World Size: ${WORLD_SIZE}"
+log \"This node: \${NODE_HOSTNAME}, Global Rank: \${NODE_RANK}, Local Rank: \${LOCAL_RANK}\"
+log \"Master: \${MASTER_ADDR}:\${MASTER_PORT}, World Size: \${WORLD_SIZE}\"
 
 # System diagnostics
-log "--- System Info ---"
-nvidia-smi | tee -a "$NODE_LOG_FILE"
-python --version | tee -a "$NODE_LOG_FILE"
-pip list | grep torch | tee -a "$NODE_LOG_FILE"
+log \"--- System Info ---\"
+nvidia-smi | tee -a \"\$NODE_LOG_FILE\"
+python --version | tee -a \"\$NODE_LOG_FILE\"
+pip list | grep torch | tee -a \"\$NODE_LOG_FILE\"
 
 # Staggered start - workers wait for head node
-if [ "$NODE_RANK" -ne "0" ]; then
-    log "Worker node waiting 30 seconds for head node to initialize..."
+if [ \"\$NODE_RANK\" -ne \"0\" ]; then
+    log \"Worker node waiting 30 seconds for head node to initialize...\"
     sleep 30
-    log "Worker node resuming"
+    log \"Worker node resuming\"
 fi
 
 # Set distributed training environment variables
-export MASTER_ADDR=$MASTER_ADDR
-export MASTER_PORT=$MASTER_PORT
-export WORLD_SIZE=$WORLD_SIZE
-export RANK=$NODE_RANK
-export LOCAL_RANK=$LOCAL_RANK
+export MASTER_ADDR=\$MASTER_ADDR
+export MASTER_PORT=\$MASTER_PORT
+export WORLD_SIZE=\$WORLD_SIZE
+export RANK=\$NODE_RANK
+export LOCAL_RANK=\$LOCAL_RANK
 export CUDA_VISIBLE_DEVICES=0  # Important: ensure only GPU 0 is visible
 export PYTHONUNBUFFERED=1
 
-log "Starting PyTorch distributed training with direct Python execution"
-log "ENV: RANK=${RANK}, LOCAL_RANK=${LOCAL_RANK}, WORLD_SIZE=${WORLD_SIZE}"
+log \"Starting PyTorch distributed training with direct Python execution\"
+log \"ENV: RANK=\${RANK}, LOCAL_RANK=\${LOCAL_RANK}, WORLD_SIZE=\${WORLD_SIZE}\"
 
-# Create a Python script to do the patching
-python -c "
-import os
-import sys
-import contextlib
+# Create a patched version of the training script using sed commands
+log \"Creating patched version of training script...\"
 
-# Get the original script path
-original_script = \"/workspace/chess-finetune.py\"
+# Copy the original script to a new location
+cp /workspace/chess-finetune.py /tmp/patched_chess-finetune.py
 
-# Read the original script
-with open(original_script, \"r\") as f:
+# Apply patches using sed
+# 1. Fix CUDA device selection
+sed -i 's/torch.cuda.set_device(torch.distributed.get_rank())/torch.cuda.set_device(int(os.environ.get(\"LOCAL_RANK\", 0)))/g' /tmp/patched_chess-finetune.py
+log \"Patched: CUDA device selection\"
+
+# 2. Add import contextlib if needed
+grep -q 'import contextlib' /tmp/patched_chess-finetune.py || sed -i 's/import torch/import torch\\nimport contextlib/g' /tmp/patched_chess-finetune.py
+log \"Patched: Added contextlib import if needed\"
+
+# 3. Add disable_amp argument - using a simpler approach
+# Create a separate python script to add the argument
+cat > /tmp/add_arg.py << EOF
+import re
+
+with open('/tmp/patched_chess-finetune.py', 'r') as f:
     content = f.read()
 
-# Make necessary patches
-patches = []
+# Check if the argument already exists
+if '--disable_amp' not in content:
+    # Find the line where ArgumentParser is created
+    match = re.search(r'parser\\s*=\\s*argparse\\.ArgumentParser\\(.*?\\)', content)
+    if match:
+        # Get the next line to determine indentation
+        next_line_match = re.search('\\n(\\s*)', content[match.end():])
+        if next_line_match:
+            indent = next_line_match.group(1)
+            # Insert right after the ArgumentParser line
+            pos = match.end()
+            content = content[:pos] + '\\n' + indent + 'parser.add_argument(\"--disable_amp\", action=\"store_true\", help=\"Disable automatic mixed precision\")' + content[pos:]
+            with open('/tmp/patched_chess-finetune.py', 'w') as f:
+                f.write(content)
+            print('Added --disable_amp argument to the script')
+        else:
+            print('Could not determine indentation')
+    else:
+        print('Could not find ArgumentParser line')
+else:
+    print('--disable_amp argument already exists')
+EOF
 
-# 1. Fix CUDA device selection
-if \"torch.cuda.set_device(torch.distributed.get_rank())\" in content:
-    content = content.replace(
-        \"torch.cuda.set_device(torch.distributed.get_rank())\",
-        \"torch.cuda.set_device(int(os.environ.get(\\\"LOCAL_RANK\\\", 0)))\"
-    )
-    patches.append(\"CUDA device selection\")
+python /tmp/add_arg.py
+log \"Patched: Added disable_amp argument using Python script\"
 
-# 2. Fix BFloat16 issue with gradient scaler
-# Add disable_amp argument if it doesn't exist
-if \"parser.add_argument(\\\"--disable_amp\\\"\" not in content:
-    content = content.replace(
-        \"parser.add_argument(\\\"--output_dir\\\"\",
-        \"parser.add_argument(\\\"--disable_amp\\\", action=\\\"store_true\\\", help=\\\"Disable automatic mixed precision\\\")\\n    parser.add_argument(\\\"--output_dir\\\"\"
-    )
+# Show a section of the patched file to verify
+cat /tmp/patched_chess-finetune.py | grep -A 10 -B 3 'ArgumentParser'
+log \"DEBUG: Showing argparse section of patched file (above)\"
 
-# Modify the scaler creation code
-if \"scaler = GradScaler()\" in content:
-    content = content.replace(
-        \"scaler = GradScaler()\",
-        \"scaler = GradScaler() if not args.disable_amp else None\"
-    )
-    patches.append(\"Added disable_amp option\")
+# 4. Modify scaler creation
+sed -i 's/scaler = GradScaler()/scaler = GradScaler() if not args.disable_amp else None/g' /tmp/patched_chess-finetune.py
+log \"Patched: Modified GradScaler creation\"
 
-# Modify the scaler usage
-if \"with autocast(device_type=\\\"cuda\\\", dtype=torch.bfloat16):\" in content:
-    content = content.replace(
-        \"with autocast(device_type=\\\"cuda\\\", dtype=torch.bfloat16):\",
-        \"with autocast(device_type=\\\"cuda\\\", dtype=torch.bfloat16) if not args.disable_amp else contextlib.nullcontext():\"
-    )
-    # Add import if not present
-    if \"import contextlib\" not in content:
-        content = content.replace(
-            \"import torch\",
-            \"import torch\\nimport contextlib\"
-        )
-    patches.append(\"Modified autocast usage\")
+# 5. Modify autocast usage
+sed -i 's/with autocast(device_type=\"cuda\", dtype=torch.bfloat16):/with autocast(device_type=\"cuda\", dtype=torch.bfloat16) if not args.disable_amp else contextlib.nullcontext():/g' /tmp/patched_chess-finetune.py
+log \"Patched: Modified autocast usage\"
 
-# Fix scaler.scale calls
-if \"scaler.scale(loss).backward()\" in content:
-    content = content.replace(
-        \"scaler.scale(loss).backward()\",
-        \"loss.backward() if args.disable_amp else scaler.scale(loss).backward()\"
-    )
-    patches.append(\"Modified backward pass\")
+# 6. Fix scaler.scale calls
+sed -i 's/scaler.scale(loss).backward()/loss.backward() if args.disable_amp else scaler.scale(loss).backward()/g' /tmp/patched_chess-finetune.py
+log \"Patched: Modified backward pass\"
 
-if \"scaler.step(optimizer)\" in content:
-    content = content.replace(
-        \"scaler.step(optimizer)\",
-        \"optimizer.step() if args.disable_amp else scaler.step(optimizer)\"
-    )
-    patches.append(\"Modified optimizer step\")
+sed -i 's/scaler.step(optimizer)/optimizer.step() if args.disable_amp else scaler.step(optimizer)/g' /tmp/patched_chess-finetune.py
+log \"Patched: Modified optimizer step\"
 
-if \"scaler.update()\" in content:
-    content = content.replace(
-        \"scaler.update()\",
-        \"scaler.update() if not args.disable_amp else None\"
-    )
-    patches.append(\"Modified scaler update\")
+sed -i 's/scaler.update()/scaler.update() if not args.disable_amp else None/g' /tmp/patched_chess-finetune.py
+log \"Patched: Modified scaler update\"
 
-# Write the patched script
-patched_script = \"/tmp/patched_chess-finetune.py\"
-with open(patched_script, \"w\") as f:
-    f.write(content)
+log \"Patching complete - running training script\"
 
-print(f\"Patched script created at {patched_script} with patches: {patches}\")
-" || log "Error in patching script creation"
+log \"DEBUG: FINETUNE_CLI_ARGS before python call: $FINETUNE_CLI_ARGS\"
+# Run the patched script
+python /tmp/patched_chess-finetune.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
+PYTHON_EXIT_CODE=\$?
 
-# Execute the patched script
-if [ -f "/tmp/patched_chess-finetune.py" ]; then
-    log "Running patched script"
-    python /tmp/patched_chess-finetune.py ${FINETUNE_CLI_ARGS} 2>&1 | tee -a "$NODE_LOG_FILE"
-    PYTHON_EXIT_CODE=$?
-else
-    log "ERROR: Patched script was not created successfully"
-    PYTHON_EXIT_CODE=1
-fi
-
-log "Python process exited with code: ${PYTHON_EXIT_CODE}"
-exit ${PYTHON_EXIT_CODE}
-'
+log \"Python process exited with code: \${PYTHON_EXIT_CODE}\"
+exit \${PYTHON_EXIT_CODE}
+"
 
 JOB_EXIT_CODE=$?
 echo "============================================================"
