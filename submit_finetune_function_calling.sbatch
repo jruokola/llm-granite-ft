@@ -16,12 +16,24 @@ echo "============================================================"
 echo "Starting Slurm job $SLURM_JOB_ID on nodes: $SLURM_JOB_NODELIST"
 echo "NNODES: $SLURM_NNODES, NTASKS_PER_NODE: $SLURM_NTASKS_PER_NODE"
 
+# Debug steps - show directory contents
+echo "============================================================"
+echo "DEBUG: Current directory and contents"
+pwd
+echo "Contents of current directory:"
+ls -la
+echo "Contents of fixed-scripts directory (if exists):"
+ls -la fixed-scripts/ || echo "fixed-scripts directory not found"
+echo "Contents of parent directory:"
+ls -la ..
+echo "============================================================"
+
 # Environment variables for distributed training
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_DISTRIBUTED_TIMEOUT=600
 
 # Set container image path - using correct syntax without docker:// prefix
-CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft:latest"
+CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft-fix:latest"
 echo "Using container image: $CONTAINER_IMAGE"
 
 # Define paths for job data and outputs
@@ -29,16 +41,20 @@ JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord"
 LOGS_DIR="${JOB_DIR}/logs"
 CHECKPOINTS_DIR="${JOB_DIR}/checkpoints"
+SCRIPTS_DIR="${JOB_DIR}/scripts"
 
 # Create directories
 echo "Creating job directories in ${JOB_DIR}"
-mkdir -p "${COORD_DIR}" "${LOGS_DIR}" "${CHECKPOINTS_DIR}"
+mkdir -p "${COORD_DIR}" "${LOGS_DIR}" "${CHECKPOINTS_DIR}" "${SCRIPTS_DIR}"
 chmod -R 777 "${JOB_DIR}"  # Ensure permissions
+
+# Note: We do not need to copy the script locally as it should be in the container at /workspace
+echo "Will use function-finetune-fixed.py from container image at /workspace"
 
 # Container paths
 CONTAINER_JOB_DIR="/job_data"
 
-# Container mounts
+# Container mounts - just mount the job directory
 CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
 
 # Training arguments
@@ -147,56 +163,18 @@ export LOCAL_RANK=\$LOCAL_RANK
 export CUDA_VISIBLE_DEVICES=0  # Important: ensure only GPU 0 is visible
 export PYTHONUNBUFFERED=1
 
-log \"Starting PyTorch distributed training with direct Python execution\"
+log \"Starting PyTorch distributed training using fixed script\"
 log \"ENV: RANK=\${RANK}, LOCAL_RANK=\${LOCAL_RANK}, WORLD_SIZE=\${WORLD_SIZE}\"
-
 log \"DEBUG: FINETUNE_CLI_ARGS before python call: $FINETUNE_CLI_ARGS\"
 
-# Create a more comprehensive patch script to fix the CUDA device assignment
-cat > /tmp/patch_script.py << 'EOF'
-import re
-import sys
+# List workspace directory content for debugging
+log \"DEBUG: Listing workspace directory content:\"
+ls -la /workspace || log \"Cannot list /workspace\"
+log \"DEBUG: Listing mounted job directory content:\"
+ls -la ${CONTAINER_JOB_DIR} || log \"Cannot list ${CONTAINER_JOB_DIR}\"
 
-# Path to the script to patch
-script_path = '/workspace/function-finetune.py'
-
-with open(script_path, 'r') as f:
-    content = f.read()
-
-# Check if the problematic pattern exists and fix CUDA device assignment
-if 'torch.cuda.set_device(torch.distributed.get_rank())' in content:
-    # Replace the problematic line with one that uses os.environ to get LOCAL_RANK
-    patched_content = content.replace(
-        'torch.cuda.set_device(torch.distributed.get_rank())',
-        'local_rank = int(os.environ.get(\"LOCAL_RANK\", 0))\ntorch.cuda.set_device(local_rank)'
-    )
-    
-    # Write the patched content back
-    with open(script_path, 'w') as f:
-        f.write(patched_content)
-    
-    print(f'Patched {script_path}: Fixed CUDA device assignment with proper local_rank definition')
-# Check for the buggy patch we might have applied earlier
-elif 'torch.cuda.set_device(local_rank)' in content and 'local_rank = ' not in content:
-    # Add local_rank definition before the problematic line
-    pattern = r'(torch\.cuda\.set_device\(local_rank\))'
-    replacement = r'local_rank = int(os.environ.get(\"LOCAL_RANK\", 0))\n\1'
-    patched_content = re.sub(pattern, replacement, content)
-    
-    # Write the patched content back
-    with open(script_path, 'w') as f:
-        f.write(patched_content)
-    
-    print(f'Patched {script_path}: Added missing local_rank definition')
-else:
-    print(f'No patching needed for {script_path} or already contains correct local_rank definition')
-EOF
-
-# Run the patch script
-python /tmp/patch_script.py
-
-# Run the training script
-python /workspace/function-finetune.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
+# Run the script directly from the workspace directory in the container
+python /workspace/function-finetune-fixed.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
 PYTHON_EXIT_CODE=\$?
 
 log \"Python process exited with code: \${PYTHON_EXIT_CODE}\"

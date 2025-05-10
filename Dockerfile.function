@@ -10,9 +10,9 @@ RUN pip install --no-cache-dir transformers>=4.41.0 datasets>=2.19.0
 
 # Copy the training script and the dataset
 # Adjust path if strategic_game_chess.jsonl is elsewhere
-COPY function-finetune.py .
-
+COPY fixed-scripts/function-finetune-fixed.py .
 # No CMD needed, will be launched by torchrun via sbatch
+RUN ls -la /workspace/
 
 ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 
