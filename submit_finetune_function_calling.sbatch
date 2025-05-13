@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=function-finetune # Simple name
+#SBATCH --job-name=function-finetune # Updated job name
 #SBATCH --nodes=2                  # Use 2 nodes for distributed training
 #SBATCH --ntasks-per-node=1        # One task per node
 #SBATCH --gres=gpu:1               # One GPU per task
 #SBATCH --cpus-per-task=16         # CPUs per task
 #SBATCH --mem=180G                 # Memory per node
 #SBATCH --time=23:59:00            # Time limit
-#SBATCH --output=/root/function_finetune_%j.log # Output to /root
+#SBATCH --output=/new_folder_name/slurm_logs/function_finetune_%j.log # Updated output path to shared drive
 #SBATCH --export=ALL               # Export environment
 
 # Basic Info
@@ -16,54 +16,36 @@ echo "============================================================"
 echo "Starting Slurm job $SLURM_JOB_ID on nodes: $SLURM_JOB_NODELIST"
 echo "NNODES: $SLURM_NNODES, NTASKS_PER_NODE: $SLURM_NTASKS_PER_NODE"
 
-# Debug steps - show directory contents
-echo "============================================================"
-echo "DEBUG: Current directory and contents"
-pwd
-echo "Contents of current directory:"
-ls -la
-echo "Contents of fixed-scripts directory (if exists):"
-ls -la fixed-scripts/ || echo "fixed-scripts directory not found"
-echo "Contents of parent directory:"
-ls -la ..
-echo "============================================================"
-
 # Environment variables for distributed training
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_DISTRIBUTED_TIMEOUT=600
 
-# Set container image path - using correct syntax without docker:// prefix
-CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft-fix:latest"
+# Set container image path
+CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft-fix:latest" # Updated container image
 echo "Using container image: $CONTAINER_IMAGE"
 
-# Define paths for job data and outputs
-JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
+# Define paths for job data and outputs on shared drive
+JOB_DIR="/new_folder_name/slurm_jobs/function_finetune/${SLURM_JOB_ID}" # Updated JOB_DIR to shared drive
 COORD_DIR="${JOB_DIR}/coord"
 LOGS_DIR="${JOB_DIR}/logs"
 CHECKPOINTS_DIR="${JOB_DIR}/checkpoints"
-SCRIPTS_DIR="${JOB_DIR}/scripts"
 
 # Create directories
 echo "Creating job directories in ${JOB_DIR}"
-mkdir -p "${COORD_DIR}" "${LOGS_DIR}" "${CHECKPOINTS_DIR}" "${SCRIPTS_DIR}"
+mkdir -p "${COORD_DIR}" "${LOGS_DIR}" "${CHECKPOINTS_DIR}"
 chmod -R 777 "${JOB_DIR}"  # Ensure permissions
 
-# Note: We do not need to copy the script locally as it should be in the container at /workspace
-echo "Will use function-finetune-fixed.py from container image at /workspace"
-
 # Container paths
-CONTAINER_JOB_DIR="/job_data"
+CONTAINER_JOB_DIR="/job_data" # This path is inside the container, referring to the mounted JOB_DIR
 
-# Container mounts - just mount the job directory
-CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
+# Container mounts
+CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}" # Mount the shared JOB_DIR to /job_data in container
 
 # Training arguments
 FINETUNE_CLI_ARGS=""
-FINETUNE_CLI_ARGS+=" --output_dir=${CONTAINER_JOB_DIR}/checkpoints"
-FINETUNE_CLI_ARGS+=" --disable_amp"  # Pass as a flag
-FINETUNE_CLI_ARGS+=" --num_epochs=1" # Set to 1 epoch
-FINETUNE_CLI_ARGS+=" --dataset_subset_size=10000" # Limit dataset size for testing
-FINETUNE_CLI_ARGS+=" --model_name_or_path=ibm-granite/granite-3.3-2b-instruct" # Correct model name format
+FINETUNE_CLI_ARGS+=" --output_dir=${CONTAINER_JOB_DIR}/checkpoints" # Output checkpoints to shared drive via container mount
+# --data_path removed as function-finetune-fixed.py loads dataset directly
+FINETUNE_CLI_ARGS+=" --disable_amp"  # Keeping this, AMP will be disabled. Remove if script default (AMP enabled) is desired.
 
 # Node and rank configuration
 HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
@@ -163,18 +145,16 @@ export LOCAL_RANK=\$LOCAL_RANK
 export CUDA_VISIBLE_DEVICES=0  # Important: ensure only GPU 0 is visible
 export PYTHONUNBUFFERED=1
 
-log \"Starting PyTorch distributed training using fixed script\"
+log \"Starting PyTorch distributed training with direct Python execution\"
 log \"ENV: RANK=\${RANK}, LOCAL_RANK=\${LOCAL_RANK}, WORLD_SIZE=\${WORLD_SIZE}\"
-log \"DEBUG: FINETUNE_CLI_ARGS before python call: $FINETUNE_CLI_ARGS\"
 
-# List workspace directory content for debugging
-log \"DEBUG: Listing workspace directory content:\"
-ls -la /workspace || log \"Cannot list /workspace\"
-log \"DEBUG: Listing mounted job directory content:\"
-ls -la ${CONTAINER_JOB_DIR} || log \"Cannot list ${CONTAINER_JOB_DIR}\"
+# The function-finetune-fixed.py script is assumed to be correctly configured,
+# so on-the-fly patching is removed.
+# Ensure '/workspace/fixed-scripts/function-finetune-fixed.py' is the correct path in your container.
 
-# Run the script directly from the workspace directory in the container
-python /workspace/function-finetune-fixed.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
+log "DEBUG: FINETUNE_CLI_ARGS before python call: $FINETUNE_CLI_ARGS"
+# Run the target script
+python /workspace/fixed-scripts/function-finetune-fixed.py $FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
 PYTHON_EXIT_CODE=\$?
 
 log \"Python process exited with code: \${PYTHON_EXIT_CODE}\"
@@ -185,4 +165,4 @@ JOB_EXIT_CODE=$?
 echo "============================================================"
 echo "Slurm job $SLURM_JOB_ID finished with exit code $JOB_EXIT_CODE"
 echo "============================================================"
-exit ${JOB_EXIT_CODE} 
+exit ${JOB_EXIT_CODE}

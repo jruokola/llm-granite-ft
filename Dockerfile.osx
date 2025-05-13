@@ -1,0 +1,35 @@
+# Use a standard Python base image
+FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Create venv
+RUN uv venv
+
+# Copy the pyproject.toml file
+# This assumes pyproject.toml is in the same directory as the Dockerfile (the build context)
+COPY pyproject.toml .
+
+# List files for verification during build (optional)
+#RUN ls -la 
+# Install PyTorch, torchvision, and torchaudio for CPU on ARM64 Linux
+RUN uv pip install --no-cache \
+    torch==2.2.1+cpu \
+    torchvision==0.17.1+cpu \
+    torchaudio==2.2.1+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies using uv sync
+# uv sync should respect the already installed PyTorch packages if versions are compatible
+# --no-cache helps keep Docker layers smaller.
+RUN uv sync --no-cache
+
+# Copy the training script
+# Adjust path if strategic_game_chess.jsonl is also needed and not bundled or downloaded by the script
+COPY fixed-scripts/function-finetune-fixed.py .
+
+# Set environment variable for transformers
+ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+
+# Provide a shell for interactive debugging
+#CMD ["bash"]
+# Alternatively, to run the script directly (ensure it handles CPU execution):
+CMD ["python", "./function-finetune-fixed.py"]
