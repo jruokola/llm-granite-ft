@@ -1,20 +1,21 @@
-import torch
 import argparse
-import subprocess
+import functools
 import logging
 import math
-import time
-import functools
 import os
+import subprocess
+import time
 
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+import torch
 from datasets import load_dataset
 from torch.amp import GradScaler
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Parse command line arguments
 parser = argparse.ArgumentParser()
@@ -29,16 +30,16 @@ parser.add_argument(
 parser.add_argument(
     "--batch_size_per_device",
     type=int,
-    default=1,
+    default=24,
     help="Per-device training batch size",
 )
 parser.add_argument(
     "--gradient_accumulation_steps",
     type=int,
-    default=8,
+    default=4,
     help="Gradient accumulation steps",
 )
-parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning Rate")
+parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning Rate")
 parser.add_argument(
     "--max_training_steps", type=int, default=-1, help="Interrupt training early."
 )
@@ -55,7 +56,7 @@ parser.add_argument(
     help="Maximum sequence length for truncation.",
 )
 parser.add_argument(
-    "--disable_amp", action="store_true", help="Disable automatic mixed precision"
+    "--disable_amp", action="store_false", help="Disable automatic mixed precision"
 )
 parser.add_argument(
     "--output_dir",
@@ -72,7 +73,7 @@ parser.add_argument(
 parser.add_argument(
     "--num_epochs",
     type=int,
-    default=1,
+    default=5,
     help="Number of epochs to train for.",
 )
 parser.add_argument(
@@ -452,7 +453,7 @@ def train(model, train_dataset, eval_dataset, args):
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size_per_device,
-        num_workers=4,
+        num_workers=16,
         collate_fn=train_dataset.collate_fn,
         sampler=train_sampler,
     )
@@ -460,7 +461,7 @@ def train(model, train_dataset, eval_dataset, args):
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=args.batch_size_per_device,
-        num_workers=4,
+        num_workers=16,
         collate_fn=eval_dataset.collate_fn,
         sampler=eval_sampler,
     )
@@ -509,7 +510,7 @@ def train(model, train_dataset, eval_dataset, args):
     epoch_loss = 0
     best_eval_loss = float("inf")
     start_time = time.time()
-    log_interval = 10
+    log_interval = 100
 
     logger.info(
         f"Starting training for {args.num_epochs} epochs ({max_train_steps} steps)"
@@ -529,7 +530,9 @@ def train(model, train_dataset, eval_dataset, args):
 
             # Forward pass with mixed precision
             if not args.disable_amp:
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.amp.autocast(
+                    device_type="cuda", dtype=torch.float16
+                ):  # Changed to float16
                     outputs = model(**batch)
                     loss = outputs.loss / args.gradient_accumulation_steps
             else:
@@ -541,20 +544,23 @@ def train(model, train_dataset, eval_dataset, args):
             epoch_loss += loss.detach().float()
 
             # Backward pass with gradient accumulation
-            if args.disable_amp:
-                loss.backward()
-            else:
+            if not args.disable_amp:  # AMP is ON, scaler is GradScaler()
                 scaler.scale(loss).backward()
+            else:  # AMP is OFF, scaler is None
+                loss.backward()
 
             # Update weights after accumulating gradients
             if ((step + 1) % args.gradient_accumulation_steps == 0) or (
                 step == len(train_dataloader) - 1
             ):
-                if args.disable_amp:
-                    optimizer.step()
-                else:
+                if not args.disable_amp:  # AMP is ON, scaler is GradScaler()
+                    scaler.unscale_(optimizer)  # Unscale gradients before clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
+                else:  # AMP is OFF, scaler is None
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
 
                 optimizer.zero_grad()
                 lr_scheduler.step()
@@ -562,7 +568,7 @@ def train(model, train_dataset, eval_dataset, args):
 
                 # Log training progress
                 if global_step % log_interval == 0:
-                    avg_loss = total_loss / log_interval
+                    avg_loss = (total_loss / log_interval).item()
                     elapsed = time.time() - start_time
                     logger.info(
                         f"Epoch: {epoch + 1}/{args.num_epochs} | "
@@ -615,7 +621,7 @@ def train(model, train_dataset, eval_dataset, args):
         # End of epoch
         epoch_time = time.time() - epoch_start_time
         logger.info(
-            f"Epoch {epoch + 1} completed in {epoch_time:.2f}s. Average loss: {epoch_loss / len(train_dataloader):.4f}"
+            f"Epoch {epoch + 1} completed in {epoch_time:.2f}s. Average loss: {(epoch_loss / len(train_dataloader)).item():.4f}"
         )
 
         # Save checkpoint at the end of each epoch
@@ -638,7 +644,9 @@ def evaluate(model, eval_dataloader, args):
 
             # Fix autocast usage here
             if not args.disable_amp:
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.amp.autocast(
+                    device_type="cuda", dtype=torch.float16
+                ):  # Changed to float16
                     outputs = model(**batch)
             else:
                 outputs = model(**batch)
@@ -664,8 +672,16 @@ def save_checkpoint(model, output_dir, checkpoint_name):
 
     # If using FSDP, we need to consolidate the model before saving
     if isinstance(model, FSDP):
-        logger.info("Consolidating FSDP model for saving...")
-        model_to_save = FSDP.consolidate_model_parallel_state(model)
+        logger.info("Gathering FSDP model full state_dict for saving...")
+        # Use the FSDP.state_dict_type context manager to get the full state dict.
+        # This will be on CPU and only on rank 0 by default.
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+            state_dict = model.state_dict()
+
+        # The save_checkpoint function is called within a rank 0 check in the main script,
+        # so the following operations will correctly occur on rank 0.
+        model_to_save = model.module  # Get the original, unwrapped module.
+        model_to_save.load_state_dict(state_dict)  # Load the full state_dict into it.
     else:
         model_to_save = model.module if hasattr(model, "module") else model
 
@@ -702,10 +718,21 @@ logger.info(f"Loading tokenizer and model from: {args.model_name_or_path}...")
 tokenizer = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
+
+# Determine model dtype based on AMP setting
+if not args.disable_amp:
+    model_torch_dtype = (
+        torch.float16
+    )  # Use float16 when AMP (and GradScaler) is enabled
+    logger.info("AMP is enabled. Loading model with torch_dtype=torch.float16.")
+else:
+    model_torch_dtype = torch.bfloat16  # Use bfloat16 when AMP is disabled
+    logger.info("AMP is disabled. Loading model with torch_dtype=torch.bfloat16.")
+
 model = AutoModelForCausalLM.from_pretrained(
     args.model_name_or_path,
     cache_dir=".cache",
-    torch_dtype=torch.bfloat16,
+    torch_dtype=model_torch_dtype,  # Use the determined dtype
     trust_remote_code=True,
 )
 logger.info("Tokenizer and model loaded.")
