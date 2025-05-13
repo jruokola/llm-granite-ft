@@ -8,6 +8,11 @@ import time
 
 import torch
 from datasets import load_dataset
+from peft import (  # , prepare_model_for_kbit_training # prepare_model_for_kbit_training might be needed for older peft
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+)
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
@@ -15,7 +20,7 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Parse command line arguments
 parser = argparse.ArgumentParser()
@@ -46,8 +51,8 @@ parser.add_argument(
 parser.add_argument(
     "--gradient_checkpointing",
     action="store_true",
-    default=True,
-    help="Use gradient checkpointing (default: True)",
+    default=False,
+    help="Use gradient checkpointing (default: False, to disable it)",
 )
 parser.add_argument(
     "--max_seq_length",
@@ -56,7 +61,10 @@ parser.add_argument(
     help="Maximum sequence length for truncation.",
 )
 parser.add_argument(
-    "--disable_amp", action="store_false", help="Disable automatic mixed precision"
+    "--disable_amp",
+    action="store_true",
+    default=False,
+    help="Disable automatic mixed precision (AMP is enabled by default)",
 )
 parser.add_argument(
     "--output_dir",
@@ -99,6 +107,25 @@ parser.add_argument(
     type=float,
     default=0.1,
     help="Ratio of steps for warmup out of total training steps",
+)
+# QLoRA / LoRA arguments
+parser.add_argument(
+    "--use_qlora", action="store_true", help="Enable QLoRA for training."
+)
+parser.add_argument(
+    "--lora_r", type=int, default=8, help="LoRA attention dimension (rank)."
+)
+parser.add_argument(
+    "--lora_alpha", type=int, default=32, help="LoRA alpha scaling factor."
+)
+parser.add_argument(
+    "--lora_dropout", type=float, default=0.05, help="LoRA dropout probability."
+)
+parser.add_argument(
+    "--lora_target_modules",
+    type=str,
+    default="q_proj,v_proj",  # Common for many models, adjust as needed
+    help="Comma-separated list of module names to apply LoRA to (e.g., 'q_proj,v_proj').",
 )
 args = parser.parse_args()
 
@@ -468,7 +495,14 @@ def train(model, train_dataset, eval_dataset, args):
 
     model.train()
     if args.gradient_checkpointing:
+        logger.info(
+            f"Rank {torch.distributed.get_rank()}: Enabling gradient checkpointing."
+        )
         model.gradient_checkpointing_enable()
+    else:
+        logger.info(
+            f"Rank {torch.distributed.get_rank()}: Gradient checkpointing is DISABLED."
+        )
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -516,15 +550,26 @@ def train(model, train_dataset, eval_dataset, args):
         f"Starting training for {args.num_epochs} epochs ({max_train_steps} steps)"
     )
     logger.info(f"Warmup for {num_warmup_steps} steps")
+    logger.info(
+        f"Rank {torch.distributed.get_rank()}: Preparing to start training epochs."
+    )
 
     for epoch in range(args.num_epochs):
         train_sampler.set_epoch(epoch)
-        logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
+        logger.info(
+            f"Rank {torch.distributed.get_rank()}: Starting epoch {epoch + 1}/{args.num_epochs}"
+        )
 
         epoch_start_time = time.time()
         epoch_loss = 0
-
+        logger.info(
+            f"Rank {torch.distributed.get_rank()}: Epoch {epoch + 1}: Initializing DataLoader iteration..."
+        )
         for step, batch in enumerate(train_dataloader):
+            if step == 0 and epoch == 0:  # Log only for the very first batch attempt
+                logger.info(
+                    f"Rank {torch.distributed.get_rank()}: Epoch {epoch + 1}, Step {step}: Successfully fetched first batch from DataLoader."
+                )
             # Move batch to GPU
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -729,13 +774,73 @@ else:
     model_torch_dtype = torch.bfloat16  # Use bfloat16 when AMP is disabled
     logger.info("AMP is disabled. Loading model with torch_dtype=torch.bfloat16.")
 
-model = AutoModelForCausalLM.from_pretrained(
-    args.model_name_or_path,
-    cache_dir=".cache",
-    torch_dtype=model_torch_dtype,  # Use the determined dtype
-    trust_remote_code=True,
-)
-logger.info("Tokenizer and model loaded.")
+if args.use_qlora:  # This is the line that needs to change
+    logger.info(
+        "QLoRA is enabled. Preparing BitsAndBytesConfig and loading model in 4-bit."
+    )
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+        if not args.disable_amp
+        else torch.float32,  # bfloat16 for compute if AMP active
+        bnb_4bit_use_double_quant=True,
+    )
+    # When using FSDP, device_map should ideally be handled by FSDP.
+    # Load model on CPU first or let FSDP handle it. For simplicity here, we might load it
+    # without an explicit device_map and let FSDP place it.
+    # Or, for initial QLoRA setup before FSDP, one might load to current device if single-GPU testing.
+    # For multi-GPU FSDP, it's safer to load on meta device or CPU if possible, then FSDP handles sharding.
+    # However, bitsandbytes 4-bit loading often requires a device.
+    # Let's try loading directly to the current device for the PEFT wrapping step,
+    # FSDP should then re-distribute. This can be tricky with FSDP.
+    # A common pattern is to load on rank 0's GPU then FSDP.
+    # If LOCAL_RANK is 0, load with quantization config. Other ranks load meta device then sync.
+    # This part needs careful handling with FSDP.
+    # For now, let's assume a simpler path and see if FSDP handles it.
+    # If issues arise, this is a key area to revisit for FSDP+QLoRA.
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        cache_dir=".cache",
+        quantization_config=bnb_config,
+        # device_map={"":torch.cuda.current_device()}, # This might conflict with FSDP if not handled carefully
+        trust_remote_code=True,
+    )
+    logger.info("Base model loaded in 4-bit for QLoRA.")
+
+    # PEFT recommends this for QLoRA, though some parts might be handled by get_peft_model
+    # model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+    # logger.info("Model prepared for k-bit training.")
+
+    # Define LoRA config
+    lora_target_modules_list = [m.strip() for m in args.lora_target_modules.split(",")]
+    logger.info(f"Applying LoRA to modules: {lora_target_modules_list}")
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=lora_target_modules_list,
+        bias="none",  # Common for QLoRA
+    )
+    model = get_peft_model(model, peft_config)
+    logger.info("LoRA applied to the model for QLoRA.")
+    model.print_trainable_parameters()
+
+else:  # Original full fine-tuning path
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        cache_dir=".cache",
+        torch_dtype=model_torch_dtype,  # Use the determined dtype
+        trust_remote_code=True,
+    )
+logger.info("Model initialized.")
+if not args.use_qlora:  # This is the line that needs to change
+    logger.info("Full model fine-tuning (not QLoRA).")
+else:  # This is new
+    logger.info("QLoRA fine-tuning is active.")
+
 
 # Load the dataset
 logger.info("Loading Function Calling dataset...")
@@ -787,7 +892,9 @@ else:
         )
 
     # Wrap model as FSDP model
+    logger.info(f"Rank {torch.distributed.get_rank()}: Starting FSDP model wrapping...")
     model = FSDP(model, device_id=device, auto_wrap_policy=auto_wrap_policy)
+    logger.info(f"Rank {torch.distributed.get_rank()}: FSDP model wrapping complete.")
 
 # Create output directory (only on rank 0)
 if torch.distributed.get_rank() == 0 and args.output_dir:

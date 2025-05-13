@@ -3,17 +3,10 @@ FROM nvcr.io/nvidia/pytorch:25.04-py3
 # Set working directory
 WORKDIR /workspace
 
-# Install minimal dependencies for chess-finetune.py
-# transformers is needed for AutoModel/Tokenizer
-# datasets is needed for torch.utils.data components used in JsonlDataset
-RUN pip install --no-cache-dir transformers>=4.41.0 datasets>=2.19.0 huggingface_hub[hf_xet]
+RUN pip install --no-cache-dir transformers>=4.41.0 datasets>=2.19.0 huggingface_hub[hf_xet] peft bitsandbytes accelerate
 
-# Copy the training script and the dataset
-# Adjust path if strategic_game_chess.jsonl is elsewhere
 COPY fixed-scripts/function-finetune-fixed.py .
 # No CMD needed, will be launched by torchrun via sbatch
 RUN ls -la /workspace/
 
 ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-
-# Removed diagnostic step 

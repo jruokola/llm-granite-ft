@@ -21,7 +21,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_DISTRIBUTED_TIMEOUT=600
 
 # Set container image path
-CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/finetune-py2407:latest" # Updated for function calling
+CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-torch2407:latest" # Updated for function calling
 echo "Using container image: $CONTAINER_IMAGE"
 
 # Define paths for job data and outputs on shared drive
