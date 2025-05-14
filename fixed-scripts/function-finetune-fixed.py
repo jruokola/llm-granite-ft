@@ -15,6 +15,7 @@ QLoRA + LoRA fine-tuning with FSDP for H100 (PyTorch 2.4).
 # 0   Standard libs
 # ────────────────────────────────────────────────────────────────────────────
 import argparse
+import functools
 import logging
 import math
 import os
@@ -30,6 +31,7 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -177,7 +179,25 @@ if args.use_fp8 and TE_AVAILABLE:
 if args.no_fsdp:
     model = torch.nn.parallel.DistributedDataParallel(model.to(device))
 else:
-    model = FSDP(model, device_id=device, use_orig_params=True, sync_module_states=True)
+    # --- define the policy ------------------------------------------------------
+    def skip_int8_modules(module: torch.nn.Module) -> bool:
+        """Return True (=wrap) only if the module contains NO int8 params."""
+        has_int8 = any(p.dtype == torch.int8 for p in module.parameters(recurse=False))
+        return not has_int8  # False → leave un-wrapped (no flatten)
+
+    custom_policy = functools.partial(
+        lambda_auto_wrap_policy,
+        lambda_fn=skip_int8_modules,  # our filter above
+    )
+
+    # --- FSDP constructor --------------------------------------------------------
+    model = FSDP(
+        model,  # your QLoRA + LoRA model
+        device_id=device,
+        auto_wrap_policy=custom_policy,  # <<< key line
+        sync_module_states=True,
+        use_orig_params=False,  # keep default flattening for float layers
+    )
 
 # ────────────────────────────────────────────────────────────────────────────
 # 7   Data loading
