@@ -66,6 +66,7 @@ parser.add_argument(
 )
 parser.add_argument("--processed_dataset_path", required=True)
 parser.add_argument("--max_seq_length", type=int, default=4096)
+parser.add_argument("--output_dir", type=str, default="/job_data/checkpoints")
 # === LoRA / QLoRA ===
 parser.add_argument("--use_qlora", action="store_true")
 parser.add_argument("--lora_r", type=int, default=8)
