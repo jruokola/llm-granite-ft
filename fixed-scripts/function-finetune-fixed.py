@@ -30,6 +30,7 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -177,12 +178,19 @@ if args.use_fp8 and TE_AVAILABLE:
 if args.no_fsdp:
     model = torch.nn.parallel.DistributedDataParallel(model.to(device))
 else:
+    # find every Linear4bit (or any module with an int8 param)
+    ignored = [
+        m
+        for m in model.modules()
+        if any(p.dtype is torch.int8 for p in m.parameters(recurse=False))
+    ]
+
     model = FSDP(
         model,
         device_id=device,
-        auto_wrap_policy=None,  # 1 shard
+        auto_wrap_policy=transformer_auto_wrap_policy,  # keep your layer shards
+        ignored_modules=ignored,  # <- new
         sync_module_states=True,
-        use_orig_params=True,  # no flatten ⇒ int8 OK
     )
 
 # ────────────────────────────────────────────────────────────────────────────
