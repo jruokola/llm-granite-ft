@@ -19,7 +19,9 @@ echo "NNODES: $SLURM_NNODES, NTASKS_PER_NODE: $SLURM_NTASKS_PER_NODE"
 # Environment variables for distributed training
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_DISTRIBUTED_TIMEOUT=600
-
+export NCCL_COLLNET_ENABLE=0
+export NCCL_IB_HCA=$(ibv_devinfo | awk '/hca_id/ {print $2; exit}')
+export NCCL_NET_GDR_LEVEL=2
 # Set container image path
 CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest" # Updated for function calling
 echo "Using container image: $CONTAINER_IMAGE"

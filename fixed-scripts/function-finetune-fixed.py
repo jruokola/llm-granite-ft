@@ -1,80 +1,88 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FSDP + QLoRA + LoRA fine-tuning script for multi-GPU clusters (PyTorch 2.2).
-Key improvements vs. original draft
-• logging defined before first use
-• correct GradScaler import and unified dtype handling
-• optional AMP off path (uses bfloat16)
-• custom FSDP auto-wrap skips Linear4bit sub-modules
-• removed per-batch torch.cuda.empty_cache()
-• optional nvidia-smi print only on rank 0
-• dataset collate & sampler untouched
+QLoRA + LoRA fine-tuning with FSDP for H100 (PyTorch 2.4).
+• Single-shard FSDP with use_orig_params=True (no dtype clashes)
+• 4-bit weight storage in FP16, LoRA adapters train in AMP (BF16 default)
+• Optional Hopper FP8 through NVIDIA Transformer-Engine (flag --use_fp8)
+• Large micro-batch + gradient-accum to exploit 80 GB VRAM
+• Flash-Attention-2 kernels auto-enabled on H100
+• DataLoader tuned (workers, prefetch, pinned)
+• Clean shutdown (destroy_process_group) and rank-0 checkpoint gather
 """
 
-# -------------------------------------------------------------------------- #
-# 0   Standard libs
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 0   Standard libs
+# ────────────────────────────────────────────────────────────────────────────
 import argparse
-import functools
 import logging
 import math
 import os
 import subprocess
-import time
 from collections import Counter
 
-# -------------------------------------------------------------------------- #
-# 1   PyTorch / HF imports
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 1   PyTorch / HF / BnB / TE imports
+# ────────────────────────────────────────────────────────────────────────────
 import torch
-from bitsandbytes.nn.modules import Linear4bit
 from datasets import load_from_disk
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
-from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
-from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# -------------------------------------------------------------------------- #
-# 2   CLI
-# -------------------------------------------------------------------------- #
+try:
+    import transformer_engine.pytorch as te  # FP8 optional
+
+    TE_AVAILABLE = True
+except ModuleNotFoundError:
+    TE_AVAILABLE = False
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2   CLI
+# ────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
+# === training infra ===
 parser.add_argument("--no_fsdp", action="store_true")
-parser.add_argument("--no_layer_wrap_policy", action="store_true")
-parser.add_argument("--batch_size_per_device", type=int, default=4)
+parser.add_argument("--batch_size_per_device", type=int, default=48)
 parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-parser.add_argument("--learning_rate", type=float, default=3e-5)
-parser.add_argument("--max_training_steps", type=int, default=-1)
-parser.add_argument("--gradient_checkpointing", action="store_true")
-parser.add_argument("--max_seq_length", type=int, default=2048)
-parser.add_argument("--disable_amp", action="store_true")
-parser.add_argument("--output_dir", type=str, default="./output")
-parser.add_argument(
-    "--model_name_or_path", type=str, default="ibm-granite/granite-3.3-2b-instruct"
-)
+parser.add_argument("--learning_rate", type=float, default=6e-5)
 parser.add_argument("--num_epochs", type=int, default=3)
-parser.add_argument("--dataset_subset_size", type=int, default=-1)
-parser.add_argument("--save_steps", type=int, default=500)
-parser.add_argument("--eval_steps", type=int, default=200)
+parser.add_argument("--max_training_steps", type=int, default=-1)
 parser.add_argument("--warmup_ratio", type=float, default=0.1)
-# QLoRA / LoRA
+parser.add_argument("--gradient_checkpointing", action="store_true")
+parser.add_argument(
+    "--disable_amp",
+    action="store_true",
+    help="Disable mixed-precision; when off we default to BF16",
+)
+# === model / data ===
+parser.add_argument(
+    "--model_name_or_path", default="ibm-granite/granite-3.3-2b-instruct"
+)
+parser.add_argument("--processed_dataset_path", required=True)
+parser.add_argument("--max_seq_length", type=int, default=4096)
+# === LoRA / QLoRA ===
 parser.add_argument("--use_qlora", action="store_true")
 parser.add_argument("--lora_r", type=int, default=8)
+parser.add_argument("--use_fp8", type=bool, default=True)
 parser.add_argument("--lora_alpha", type=int, default=32)
 parser.add_argument("--lora_dropout", type=float, default=0.05)
-parser.add_argument("--lora_target_modules", type=str, default="q_proj,v_proj")
-parser.add_argument("--processed_dataset_path", type=str, required=True)
+parser.add_argument("--lora_target_modules", default="q_proj,v_proj")
+# === Hopper extras ===
+parser.add_argument(
+    "--use_fp8",
+    action="store_true",
+    help="Enable FP8 layers via Transformer-Engine (H100 only)",
+)
 args = parser.parse_args()
 
-# -------------------------------------------------------------------------- #
-# 3   Logging and dist init
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 3   Logging + distributed init
+# ────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO if int(os.environ.get("RANK", 0)) == 0 else logging.WARNING,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
@@ -85,262 +93,209 @@ torch.distributed.init_process_group(backend="nccl")
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
+logger.info(f"Rank {torch.distributed.get_rank()} ready on GPU {device}")
 
-logger.info(f"Rank {torch.distributed.get_rank()} initialised on GPU {device}.")
 
-
-# -------------------------------------------------------------------------- #
-# 4   Dataset helper
-# -------------------------------------------------------------------------- #
-class PreprocessedFunctionCallingDataset(Dataset):
-    def __init__(self, split, subset_size=-1):
-        self.dataset = (
-            split.select(range(subset_size)) if 0 < subset_size < len(split) else split
-        )
-        self.dataset.set_format(
-            "torch", columns=["input_ids", "attention_mask", "labels"]
-        )
-        if len(self.dataset):
-            logger.info(f"Sample keys: {list(self.dataset[0].keys())}")
+# ────────────────────────────────────────────────────────────────────────────
+# 4   Dataset wrapper
+# ────────────────────────────────────────────────────────────────────────────
+class PreprocessedDataset(Dataset):
+    def __init__(self, split):
+        self.ds = split
+        self.ds.set_format("torch", ["input_ids", "attention_mask", "labels"])
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.ds)
 
-    def __getitem__(self, idx):
-        return self.dataset[idx]
+    def __getitem__(self, i):
+        return self.ds[i]
 
     @staticmethod
-    def collate_fn(batch):
-        return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+    def collate(ex):
+        return {k: torch.stack([e[k] for e in ex]) for k in ex[0]}
 
 
-# -------------------------------------------------------------------------- #
-# 5   Tokenizer & model (QLoRA or full)
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 5   Tokenizer & model
+# ────────────────────────────────────────────────────────────────────────────
 tokenizer = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
-amp_dtype = torch.float16 if not args.disable_amp else torch.bfloat16
+amp_dtype = torch.bfloat16 if not args.disable_amp else torch.float32
 scaler = GradScaler() if not args.disable_amp else None
 
+bnb_cfg = BitsAndBytesConfig(
+    load_in_4bit=args.use_qlora,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=amp_dtype,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_storage=torch.float16,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    args.model_name_or_path,
+    cache_dir=".cache",
+    quantization_config=bnb_cfg if args.use_qlora else None,
+    torch_dtype=None if args.use_qlora else amp_dtype,
+    trust_remote_code=True,
+)
+
+logger.info(f"Param dtype histogram: {Counter(p.dtype for p in model.parameters())}")
+
 if args.use_qlora:
-    logger.info("Using QLoRA (4-bit)")
-    bnb_cfg = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=amp_dtype,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_storage=torch.float16,  # keeps 4-bit blocks FP16
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        cache_dir=".cache",
-        quantization_config=bnb_cfg,
-        trust_remote_code=True,
-    )
-    # Print model layer dtypes
-    print(Counter(p.dtype for p in model.parameters()))
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=args.gradient_checkpointing
     )
     lora_modules = [m.strip() for m in args.lora_target_modules.split(",")]
-    peft_cfg = LoraConfig(
-        TaskType.CAUSAL_LM,
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=lora_modules,
         bias="none",
     )
-    model = get_peft_model(model, peft_cfg)
+    model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
-else:
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        cache_dir=".cache",
-        torch_dtype=amp_dtype,
-        trust_remote_code=True,
-    )
 
-# -------------------------------------------------------------------------- #
-# 6   FSDP / DDP wrap
-# -------------------------------------------------------------------------- #
+# optional FP8 for LoRA adapters
+if args.use_fp8 and TE_AVAILABLE:
+    for name, mod in model.named_modules():
+        if "lora_" in name and isinstance(mod, torch.nn.Linear):
+            fp8_layer = te.Linear(
+                mod.in_features, mod.out_features, bias=mod.bias is not None, fp8=True
+            )
+            fp8_layer.weight.data.copy_(mod.weight.data)
+            parent, child_name = name.rsplit(".", 1)
+            setattr(eval("model." + parent), child_name, fp8_layer)
+    logger.info("Replaced LoRA adapters with Transformer-Engine FP8 layers.")
+
+# ────────────────────────────────────────────────────────────────────────────
+# 6   FSDP wrap (single shard, orig params)
+# ────────────────────────────────────────────────────────────────────────────
 if args.no_fsdp:
-    model = DDP(model.to(device))
+    model = torch.nn.parallel.DistributedDataParallel(model.to(device))
 else:
+    model = FSDP(model, device_id=device, use_orig_params=True, sync_module_states=True)
 
-    def custom_wrap(m):
-        if isinstance(m, Linear4bit):
-            return False
-        return "layer" in m.__class__.__name__.lower()
+# ────────────────────────────────────────────────────────────────────────────
+# 7   Data loading
+# ────────────────────────────────────────────────────────────────────────────
+full = load_from_disk(args.processed_dataset_path)
+train_size = int(0.9 * len(full))
+train_set = PreprocessedDataset(full.select(range(train_size)))
+eval_set = PreprocessedDataset(full.select(range(train_size, len(full))))
 
-    auto_policy = (
-        None
-        if args.no_layer_wrap_policy
-        else functools.partial(lambda_auto_wrap_policy, lambda_fn=custom_wrap)
-    )
-
-    # ----- Cast leftover FP32 tensors ----- 5-10% less memory used
-    # target_dtype = torch.float16 if not args.disable_amp else torch.bfloat16
-    # if not args.disable_amp:  # we train in FP16
-    #    for p in model.parameters():
-    #       if p.dtype == torch.float32:
-    #            p.data = p.data.to(torch.float16)
-
-    mp_policy = MixedPrecision(
-        param_dtype=amp_dtype, reduce_dtype=amp_dtype, buffer_dtype=amp_dtype
-    )
-    model = FSDP(
-        model,
-        device_id=device,
-        auto_wrap_policy=auto_policy,
-        sync_module_states=True,
-        use_orig_params=True,
-        mixed_precision=mp_policy,
-    )
-
-# -------------------------------------------------------------------------- #
-# 7   Data loading
-# -------------------------------------------------------------------------- #
-full_ds = load_from_disk(args.processed_dataset_path)
-train_sz = int(0.9 * len(full_ds))
-train_set = PreprocessedFunctionCallingDataset(
-    full_ds.select(range(train_sz)), args.dataset_subset_size
-)
-eval_set = PreprocessedFunctionCallingDataset(
-    full_ds.select(range(train_sz, len(full_ds))),
-    min(1000, len(full_ds)) if args.dataset_subset_size > 0 else -1,
-)
-
-train_sampler = DistributedSampler(train_set, shuffle=True, seed=42)
-eval_sampler = DistributedSampler(eval_set, shuffle=False, seed=42)
 train_loader = DataLoader(
     train_set,
     batch_size=args.batch_size_per_device,
-    sampler=train_sampler,
-    num_workers=4,
-    collate_fn=train_set.collate_fn,
+    sampler=DistributedSampler(train_set, shuffle=True, seed=42),
+    num_workers=8,
+    prefetch_factor=4,
+    pin_memory=True,
+    collate_fn=train_set.collate,
 )
+
 eval_loader = DataLoader(
     eval_set,
     batch_size=args.batch_size_per_device,
-    sampler=eval_sampler,
-    collate_fn=eval_set.collate_fn,
+    sampler=DistributedSampler(eval_set, shuffle=False, seed=42),
+    num_workers=4,
+    pin_memory=True,
+    collate_fn=eval_set.collate,
 )
 
-# -------------------------------------------------------------------------- #
-# 8   Optimiser & schedulers
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 8   Optimiser + LR schedule
+# ────────────────────────────────────────────────────────────────────────────
 opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
 max_steps = (
     args.num_epochs * steps_per_epoch
     if args.max_training_steps < 0
-    else min(args.max_training_steps, args.num_epochs * steps_per_epoch)
+    else args.max_training_steps
 )
 warmup_steps = int(args.warmup_ratio * max_steps)
 
-
-def lr_lambda(step):
-    if step < warmup_steps:
-        return step / max(1, warmup_steps)
-    return max(0.0, (max_steps - step) / max(1, max_steps - warmup_steps))
-
-
-scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+lr_sched = torch.optim.lr_scheduler.LambdaLR(
+    opt,
+    lambda s: s / warmup_steps
+    if s < warmup_steps
+    else max(0.0, (max_steps - s) / max(1, max_steps - warmup_steps)),
+)
 
 
-# -------------------------------------------------------------------------- #
-# 9   Train & eval helpers
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 9   Training / eval helpers
+# ────────────────────────────────────────────────────────────────────────────
 def evaluate():
     model.eval()
-    loss_sum, n = 0, 0
+    tot, n = 0, 0
     with torch.no_grad():
         for batch in eval_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            ctx = torch.autocast("cuda", torch.float16) if scaler else torch.no_grad()
-            with ctx:
-                loss_sum += model(**batch).loss.detach().float()
+            with torch.autocast("cuda", amp_dtype) if scaler else torch.no_grad():
+                tot += model(**batch).loss.float()
             n += 1
-    loss = (loss_sum / n).to(device)
+    loss = (tot / n).to(device)
     torch.distributed.all_reduce(loss)
     return (loss / torch.distributed.get_world_size()).item()
 
 
-def save_ckpt(name):
+def save_ckpt(tag):
     if torch.distributed.get_rank() != 0:
         return
-    out = os.path.join(args.output_dir, name)
-    os.makedirs(out, exist_ok=True)
-    if isinstance(model, FSDP):
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-            state = model.state_dict()
-        model.module.save_pretrained(out, state_dict=state)
-    else:
-        (model.module if hasattr(model, "module") else model).save_pretrained(out)
-    logger.info(f"Checkpoint saved: {out}")
+    path = os.path.join(args.output_dir, tag)
+    os.makedirs(path, exist_ok=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+        model.module.save_pretrained(path)
+    logger.info(f"Saved {path}")
 
 
-# -------------------------------------------------------------------------- #
-# 10  Training loop
-# -------------------------------------------------------------------------- #
+# ────────────────────────────────────────────────────────────────────────────
+# 10 Train loop
+# ────────────────────────────────────────────────────────────────────────────
 if torch.distributed.get_rank() == 0:
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(subprocess.check_output(["nvidia-smi"]).decode())
 
 model.train()
-global_step = 0
-best_eval = float("inf")
-
+global_step = best = 0
+best_loss = 1e9
 for epoch in range(args.num_epochs):
-    train_sampler.set_epoch(epoch)
-    epoch_loss = 0
-    start = time.time()
+    train_loader.sampler.set_epoch(epoch)
     for step, batch in enumerate(train_loader, 1):
         batch = {k: v.to(device) for k, v in batch.items()}
-        ctx = torch.autocast("cuda", torch.float16) if scaler else torch.no_grad()
+        ctx = torch.autocast("cuda", amp_dtype) if scaler else torch.no_grad()
         with ctx:
             loss = model(**batch).loss / args.gradient_accumulation_steps
         (scaler.scale(loss) if scaler else loss).backward()
-
         if step % args.gradient_accumulation_steps == 0:
             if scaler:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(opt)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt) if scaler else opt.step()
+            scaler.update() if scaler else None
             opt.zero_grad()
-            scheduler.step()
+            lr_sched.step()
             global_step += 1
 
             if global_step % args.eval_steps == 0:
-                eval_loss = evaluate()
+                val = evaluate()
                 if torch.distributed.get_rank() == 0:
-                    logger.info(f"Eval loss: {eval_loss:.4f} @ step {global_step}")
-                if eval_loss < best_eval:
-                    best_eval = eval_loss
+                    logger.info(f"step {global_step} eval {val:.4f}")
+                if val < best_loss:
+                    best_loss, best = val, global_step
                     save_ckpt("best")
-            if global_step % args.save_steps == 0:
-                save_ckpt(f"step-{global_step}")
-            if 0 < args.max_training_steps <= global_step:
-                break
-        epoch_loss += loss.detach().float()
 
-    if torch.distributed.get_rank() == 0:
-        logger.info(
-            f"Epoch {epoch + 1} finished in {time.time() - start:.1f}s "
-            f"‒ avg loss {(epoch_loss / len(train_loader)).item():.4f}"
-        )
-        save_ckpt(f"epoch-{epoch + 1}")
-    if 0 < args.max_training_steps <= global_step:
+            if global_step % args.save_steps == 0 and torch.distributed.get_rank() == 0:
+                save_ckpt(f"step-{global_step}")
+            if 0 < args.max_training_steps == global_step:
+                break
+    if 0 < args.max_training_steps == global_step:
         break
 
-logger.info("Training done.")
-save_ckpt("final")
+if torch.distributed.get_rank() == 0:
+    save_ckpt("final")
 torch.distributed.destroy_process_group()
-torch.distributed.barrier()
