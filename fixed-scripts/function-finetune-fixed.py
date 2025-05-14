@@ -22,6 +22,7 @@ import math
 import os
 import subprocess
 import time
+from collections import Counter
 
 # -------------------------------------------------------------------------- #
 # 1   PyTorch / HF imports
@@ -30,7 +31,7 @@ import torch
 from bitsandbytes.nn.modules import Linear4bit
 from datasets import load_from_disk
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
@@ -129,7 +130,7 @@ if args.use_qlora:
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=amp_dtype,
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_storage=torch.float16,
+        bnb_4bit_quant_storage=torch.float16,  # keeps 4-bit blocks FP16
     )
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
@@ -137,6 +138,8 @@ if args.use_qlora:
         quantization_config=bnb_cfg,
         trust_remote_code=True,
     )
+    # Print model layer dtypes
+    print(Counter(p.dtype for p in model.parameters()))
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=args.gradient_checkpointing
     )
@@ -177,12 +180,23 @@ else:
         else functools.partial(lambda_auto_wrap_policy, lambda_fn=custom_wrap)
     )
 
+    # ----- Cast leftover FP32 tensors ----- 5-10% less memory used
+    # target_dtype = torch.float16 if not args.disable_amp else torch.bfloat16
+    # if not args.disable_amp:  # we train in FP16
+    #    for p in model.parameters():
+    #       if p.dtype == torch.float32:
+    #            p.data = p.data.to(torch.float16)
+
+    mp_policy = FSDP.MixedPrecision(
+        param_dtype=amp_dtype, reduce_dtype=amp_dtype, buffer_dtype=amp_dtype
+    )
     model = FSDP(
         model,
         device_id=device,
         auto_wrap_policy=auto_policy,
         sync_module_states=True,
-        # use_orig_params=True
+        use_orig_params=True,
+        mixed_precision=mp_policy,
     )
 
 # -------------------------------------------------------------------------- #
@@ -327,4 +341,5 @@ for epoch in range(args.num_epochs):
 
 logger.info("Training done.")
 save_ckpt("final")
+torch.distributed.destroy_process_group()
 torch.distributed.barrier()
