@@ -7,6 +7,7 @@ import subprocess
 import time
 
 import torch
+from bitsandbytes.nn.modules import Linear4bit  # Added for custom wrap policy
 from datasets import load_from_disk  # Added load_from_disk
 from peft import (
     LoraConfig,
@@ -644,14 +645,35 @@ if args.no_fsdp:
 else:
     auto_wrap_policy = None
     if not args.no_layer_wrap_policy:
-        # Identify which modules have "layer" in their class name and use these
-        # as the basic FSDP blocks that are sharded and exchanged between GPUs
-        def layer_policy_fn(module):
-            return "layer" in module.__class__.__name__.lower()
+        # Custom FSDP wrap policy for QLoRA
+        # Goal: Wrap the main transformer blocks, ensure Linear4bit layers are handled
+        # as part of their parent FSDP unit, not individually.
+        def custom_fsdp_wrap_policy(module):
+            # Explicitly do not wrap Linear4bit layers if encountered directly.
+            # FSDP should manage their parameters via the parent FSDP module.
+            if isinstance(module, Linear4bit):
+                return False
+
+            # Original policy: wrap modules if "layer" is in their class name.
+            # This assumes these "layer" modules are the actual transformer blocks
+            # (or suitable larger components) that contain the Linear4bit layers.
+            if "layer" in module.__class__.__name__.lower():
+                # logger.info(f"FSDP: Wrapping module by name: {module.__class__.__name__}") # Optional: for debugging policy
+                return True
+
+            return (
+                False  # Default: do not wrap other modules by this specific policy rule
+            )
 
         auto_wrap_policy = functools.partial(
-            lambda_auto_wrap_policy, lambda_fn=layer_policy_fn
+            lambda_auto_wrap_policy, lambda_fn=custom_fsdp_wrap_policy
         )
+        logger.info("Using custom FSDP auto wrap policy for QLoRA.")
+    else:
+        logger.info(
+            "FSDP auto_wrap_policy is disabled by --no_layer_wrap_policy (model will be one FSDP unit)."
+        )
+        # auto_wrap_policy remains None, FSDP wraps the whole model
 
     # Wrap model as FSDP model
     logger.info(f"Rank {torch.distributed.get_rank()}: Starting FSDP model wrapping...")

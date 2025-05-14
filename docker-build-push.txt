@@ -1,5 +1,5 @@
-docker buildx build -t cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest . -f=Dockerfile.function
-docker push cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest
+docker buildx build -t cr.eu-north1.nebius.cloud/00hdcpaq6azg81mmp/finetune-transformers:latest . -f=Dockerfile.function
+docker push cr.eu-north1.nebius.cloud/00hdcpaq6azg81mmp/transformers:latest
 
 sftp -r ~/.ssh/id_ed25519 /Users/jokkeruokolainen/Documents/Personal/Nebius/llm-granite-ft root@89.169.103.66:/root/llm-granite-ft -m
 
@@ -9,11 +9,27 @@ docker save -o finetune-transformers_local.tar finetune-transformers:latest
 
 enroot import -o /root/finetune-transformers_local.sqsh docker-archive:/root/finetune-transformers_local.tar
 
+export TR_PUBLIC_IP_ADDRESS=$(nebius compute instance get \
+  --id computeinstance-e00ean551rtbssffa4 \
+  --format json \
+  | jq -r '.status.network_interfaces.[0].public_ip_address.address | split("/")[0]')
 
-uv run python fixed-scripts/test_dataproc.py \                      ✘ 255 took  12m 44s  base  system at  17:14:57
+lftp -u jokke, \
+     -e "set sftp:connect-program 'ssh -a -x -i ~/.ssh/id_rsa -o StrictHostKeyChecking=accept-new'; \
+         mirror -R --parallel=8 \
+         /Users/jokkeruokolainen/Documents/Personal/Nebius/llm-granite-ft  \
+         /home/jokke/llm-granite-ft; \
+         quit" \
+    sftp://195.242.10.113
+ssh user@$TR_PUBLIC_IP_ADDRESS
+
+uv run python fixed-scripts/test_dataproc.py \
     --model_name_or_path "ibm-granite/granite-3.3-2b-instruct" \
     --dataset_name "glaiveai/glaive-function-calling-v2" \
     --dataset_data_file "glaive-function-calling-v2.json" \
     --output_path "./glaive_fc_v2" \
     --max_seq_length 2048 \
-    --num_samples_to_process -1 # Process all samples
+    --num_samples_to_process -1 
+
+
+scp -i function-finetune-fixed.py /Users/jokkeruokolainen/Documents/Personal/Nebius/llm-granite-ft/fixed-scripts/function-finetune-fixed.py jokke@195.242.10.113:/home/jokke/llm-granite-ft/fixed-scripts/
