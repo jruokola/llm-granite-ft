@@ -46,7 +46,7 @@ CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
 FINETUNE_CLI_ARGS=""
 FINETUNE_CLI_ARGS+=" --output_dir=${CONTAINER_JOB_DIR}/checkpoints"
 # FINETUNE_CLI_ARGS+=" --data_path=${CONTAINER_DATA_PATH}" # Removed for function calling script
-FINETUNE_CLI_ARGS+=" --disable_amp"  # Keeping this for now
+# FINETUNE_CLI_ARGS+=" --disable_amp"  # Keeping this for now
 
 # Node and rank configuration (same as chess_sbatch)
 HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
