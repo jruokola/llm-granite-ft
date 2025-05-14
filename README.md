@@ -41,7 +41,7 @@ llm-granite-ft/
 
 * **For Chess Fine-tuning:** The `strategic_game_chess.jsonl` file should be present in the `llm-granite-ft` directory when building the Docker image, as `Dockerfile.chess` copies it into the image.
 
-* **For Function Calling Fine-tuning:** The `function-finetune-fixed.py` script loads the `glaiveai/glaive-function-calling-v2` dataset directly using the Hugging Face `datasets` library. Ensure the compute nodes have internet access to download the dataset, or that it's pre-cached in a location accessible by the script (e.g., via `HF_DATASETS_CACHE` environment variable pointing to a shared drive location, or by building it into the container if small enough).
+* **For Function Calling Fine-tuning:** The `fixed-scripts/function-finetune-fixed.py` script now **requires** a preprocessed dataset. You must first process your raw data (e.g., from `glaiveai/glaive-function-calling-v2`) into the format expected by the script and provide the path to this processed dataset via the `--processed_dataset_path` argument in the sbatch script. The script uses `datasets.load_from_disk` to load this.
 
 ### 2. Build and Push Docker Images
 
@@ -72,15 +72,18 @@ You will need to build and push separate Docker images for each fine-tuning task
     ```bash
     # Replace <tag> with your desired tag, e.g., latest
     # The image name should match what's in submit_finetune_function_calling.sbatch
-    docker build -f Dockerfile.function -t cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft-fix:<tag> .
+    # Example:
+    docker build -f Dockerfile.function -t cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest .
     ```
 
-    (Ensure `Dockerfile.function` is correctly set up to include `fixed-scripts/function-finetune-fixed.py` and its dependencies.)
+    (Ensure `Dockerfile.function` is correctly set up to include `fixed-scripts/function-finetune-fixed.py` and its dependencies like `peft`, `bitsandbytes`, `transformer_engine` if using FP8, etc.)
 3. Push the image:
 
     ```bash
-    docker push cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft-fix:<tag>
+    docker push cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest
     ```
+
+    (Use your actual image name and tag).
 
 ### 3. Configure Slurm Submission Scripts
 
@@ -113,22 +116,19 @@ This script is used to launch `fixed-scripts/function-finetune-fixed.py`. Place 
 **Key configurations in `submit_finetune_function_calling.sbatch`:**
 
 * **Job Name:** Set to `function-finetune`.
-* **Output Log:** Main Slurm log is directed to `/new_folder_name/slurm_logs/function_finetune_%j.log`. Node-specific logs are created within the job's shared directory.
-* **Container Image:** Uses `cr.eu-north1.nebius.cloud/e00xn9gpx27cp05wsr/llm-granite-function-ft-fix:latest`.
-* **Shared Job Directory:** Base directory for outputs, logs, and coordination files is `/new_folder_name/slurm_jobs/function_finetune/${SLURM_JOB_ID}`. This is mounted into the container at `/job_data`.
-* **Python Script:** Executes `/workspace/fixed-scripts/function-finetune-fixed.py` (ensure this path is correct within your container).
-* **Distributed Setup:**
-  * The script manually sets up `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` environment variables.
-  * `MASTER_ADDR` and `MASTER_PORT` are determined from the first node in `SLURM_JOB_NODELIST` and a fixed port (29510).
-  * `WORLD_SIZE` is `SLURM_NNODES`.
-  * `RANK` is determined by node hostname.
-  * `LOCAL_RANK` is hardcoded to `0` (suitable for 1 task/GPU per node).
-  * This setup does **not** use `torchrun`; the Python script is launched directly with `python ...`.
+* **Output Log:** Main Slurm log is directed to `/root/slurm_logs/function_finetune_%j.log`. Node-specific logs are created within the job's shared directory.
+* **Container Image:** The sbatch script uses `CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest"`. Ensure this matches the image you built and pushed.
+* **Shared Job Directory:** Base directory for outputs, logs, and coordination files is `/root/slurm_jobs/function_finetune/${SLURM_JOB_ID}`. This is mounted into the container at `/job_data`.
+* **Python Script:** Executes `/workspace/function-finetune-fixed.py`.
+* **NCCL Environment Variables:** The sbatch script now sets `NCCL_COLLNET_ENABLE=0`, `NCCL_IB_HCA`, and `NCCL_NET_GDR_LEVEL`.
+* **Distributed Setup (Manual):**
+  * The script manually sets up `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` environment variables for the Python script. This setup does **not** use `torchrun`.
 * **Python Script Arguments (`FINETUNE_CLI_ARGS`):**
-  * `--output_dir` is set to `${CONTAINER_JOB_DIR}/checkpoints` (maps to the shared drive).
-  * `--disable_amp` is passed by default, meaning Automatic Mixed Precision is turned off. You can remove this from the sbatch script if you wish to use the Python script's default AMP behavior (which is typically AMP enabled).
-  * Other arguments for `function-finetune-fixed.py` can be added to `FINETUNE_CLI_ARGS` as needed.
-* **No On-the-fly Patching:** Unlike the example chess script, this sbatch script directly runs the Python script without `sed` modifications, assuming `function-finetune-fixed.py` is already correctly configured.
+  * `--output_dir` is set to `${CONTAINER_JOB_DIR}/checkpoints`.
+  * `--processed_dataset_path` is set to `/processed_datasets/glaive_fc_v2`. This path is inside the container and assumes your `Dockerfile.function` copies your preprocessed data to this location. **This is a critical change: the script now requires a preprocessed dataset.**
+  * `--use_qlora` is passed by default, enabling QLoRA.
+  * The `--disable_amp` argument is **not** passed by default in the current sbatch script (the line is commented out). This means the Python script's default AMP behavior (BF16 with GradScaler) will be active.
+  * Other arguments for `function-finetune-fixed.py` (e.g., `--batch_size_per_device`, `--learning_rate`, LoRA parameters) can be added to `FINETUNE_CLI_ARGS`.
 
 ### 4. Configure Enroot Authentication (If using private registry)
 
@@ -175,12 +175,24 @@ Ensure the paths to the sbatch scripts are correct.
 
 ### b. Function Calling Fine-tuning (`fixed-scripts/function-finetune-fixed.py`)
 
-* Designed for distributed training using PyTorch FSDP (default) or DDP (`--no_fsdp` flag).
-* Fine-tunes models like `ibm-granite/granite-3.3-2b-instruct` on the `glaiveai/glaive-function-calling-v2` dataset (loaded via Hugging Face `datasets`).
-* Parses a comprehensive set of command-line arguments for controlling training parameters, including AMP, FSDP/DDP, learning rate, batch sizes, etc.
-* Implements a detailed `FunctionCallingDataset` class for processing the specific data format.
-* Uses `torch.optim.AdamW`, `GradScaler` (conditional on AMP), and a linear warmup LR schedule.
-* Launched directly via `python fixed-scripts/function-finetune-fixed.py ...` within the `srun` command in `submit_finetune_function_calling.sbatch`. The distributed environment (`MASTER_ADDR`, `RANK`, etc.) is manually configured by the sbatch script.
+* **Current Version (as of last update):** This script is significantly refactored for fine-tuning models like `ibm-granite/granite-3.3-2b-instruct` using PyTorch FSDP with QLoRA.
+* **Key Features:**
+  * **FSDP:** Uses `torch.distributed.fsdp.FullyShardedDataParallel` by default.
+    * Employs `transformer_auto_wrap_policy` for layer sharding.
+    * Includes logic to set `ignored_modules` for FSDP, particularly for handling potential `int8` parameters from quantization.
+    * Uses `sync_module_states=True` and `StateDictType.FULL_STATE_DICT` for robust checkpointing.
+  * **QLoRA:** Enabled via the `--use_qlora` flag.
+    * Configures `BitsAndBytesConfig` for 4-bit quantization (`nf4`, `bnb_4bit_quant_storage=torch.float16`).
+    * Uses `peft.prepare_model_for_kbit_training` and `peft.get_peft_model` with `LoraConfig`.
+  * **FP8 Support (Optional):** Includes experimental support for NVIDIA Transformer Engine FP8 for LoRA adapters (`--use_fp8`), if `transformer_engine` is available.
+  * **Data Handling:**
+    * **Requires preprocessed data:** The script loads data using `datasets.load_from_disk` via the mandatory `--processed_dataset_path` argument. On-the-fly processing of raw datasets is no longer supported in this version.
+    * Uses a custom `PreprocessedDataset` class.
+  * **Mixed Precision:** AMP is enabled by default using `torch.bfloat16` and `GradScaler`. Can be disabled with `--disable_amp` (falls back to `torch.float32` for `bnb_4bit_compute_dtype` if QLoRA is also off, otherwise `amp_dtype` becomes `float32`).
+  * **Optimizer & Scheduler:** Uses `torch.optim.AdamW` and a linear warmup LR schedule.
+  * **Gradient Checkpointing:** Supported via `--gradient_checkpointing`.
+  * **Logging & Checkpointing:** Standard logging and checkpoint saving logic, compatible with FSDP.
+  * **Distributed Launch:** Designed to be launched directly by `python` with environment variables for distributed setup (as done by the sbatch script), not `torchrun`.
 
 ## Dockerization
 
@@ -193,10 +205,9 @@ Ensure the paths to the sbatch scripts are correct.
 ### b. `Dockerfile.function` (for Function Calling Fine-tuning)
 
 * This Dockerfile (e.g., named `Dockerfile.function` or similar, corresponding to the image `llm-granite-function-ft-fix`) should be set up to:
-  * Use a suitable PyTorch base image compatible with NVIDIA H100s (e.g., a recent NVIDIA PyTorch container).
-  * Install necessary dependencies specified in `pyproject.toml` (e.g., using `uv pip install ...`).
-  * Copy the `fixed-scripts/function-finetune-fixed.py` script into the container (e.g., to `/workspace/fixed-scripts/function-finetune-fixed.py`).
-  * Set up any other necessary environment configurations.
+  * Use a suitable PyTorch base image (e.g., `nvcr.io/nvidia/pytorch:24.07-py3` or newer, as used in recent examples).
+  * Install dependencies like `transformers`, `datasets`, `peft`, `bitsandbytes`, `accelerate`, and optionally `transformer_engine` (for FP8).
+  * Copy the `fixed-scripts/function-finetune-fixed.py` script and any other necessary local files (like preprocessed datasets if built into the image, though the sbatch script assumes `/processed_datasets/glaive_fc_v2` is already in the image from a `COPY` command).
 
 ## Troubleshooting
 
@@ -204,7 +215,7 @@ Ensure the paths to the sbatch scripts are correct.
 * **Image Pull Errors (401 Unauthorized):** Verify Enroot authentication credentials for your registry.
 * **Pyxis Errors (`couldn't start container`):** Check image pull success, `--container-mounts` validity (host path exists and has permissions), and basic container functionality.
 * **`torchrun` Errors / DDP Init Errors (for `chess-finetune.py` or similar `torchrun`-based scripts):** Ensure `srun` is passing necessary Slurm environment variables (`SLURM_PROCID`, `SLURM_NTASKS`, etc.) correctly into the container for `torchrun` auto-detection.
-* **Direct Python Launch DDP Init Errors (for `function-finetune-fixed.py`):** If `torch.distributed.init_process_group` fails or hangs, double-check that `MASTER_ADDR`, `MASTER_PORT`, `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` are correctly set by the `submit_finetune_function_calling.sbatch` script (e.g., by examining the node-specific logs in `/new_folder_name/slurm_jobs/function_finetune/${SLURM_JOB_ID}/logs/`).
+* **Direct Python Launch DDP/FSDP Init Errors (for `function-finetune-fixed.py`):** If `torch.distributed.init_process_group` fails or hangs, double-check that `MASTER_ADDR`, `MASTER_PORT`, `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` are correctly set by the `submit_finetune_function_calling.sbatch` script (e.g., by examining the node-specific logs in `/root/slurm_jobs/function_finetune/${SLURM_JOB_ID}/logs/`). Also check the new NCCL environment variables in the sbatch script.
 * **`ModuleNotFoundError`:** Ensure the respective Dockerfile (`Dockerfile.chess` or `Dockerfile.function`) installs all required Python packages. Check `PYTHONPATH` if necessary, although direct script execution in `/workspace` (or `/workspace/fixed-scripts/`) should generally work if scripts and dependencies are correctly placed.
 * **CUDA Errors / `nvidia-smi` fails inside container:** Likely an issue with Pyxis/Enroot setup, host drivers, or Slurm GPU resource allocation (`gres.conf`, cgroups). Escalate to admin if basic checks fail.
 * **Node Failure:** As seen previously, check `slurmctld.log` via admin for hardware/daemon issues on the specific worker node.
