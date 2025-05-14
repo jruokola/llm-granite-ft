@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir transformers>=4.41.0 datasets>=2.19.0 huggingface
 
 COPY fixed-scripts/function-finetune-fixed.py .
 
-COPY /glaive_fc_v2/* ./processed_datasets/glaive_fc_v2/
+COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
 
 # No CMD needed, will be launched by torchrun via sbatch
 RUN ls -la /workspace/

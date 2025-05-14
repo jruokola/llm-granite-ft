@@ -197,17 +197,19 @@ def train(model, train_dataset, eval_dataset, args):
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size_per_device,
-        num_workers=8,
+        num_workers=8,  # Adjusted num_workers
         collate_fn=train_dataset.collate_fn,
         sampler=train_sampler,
+        pin_memory=True,  # Added pin_memory
     )
 
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=args.batch_size_per_device,
-        num_workers=8,
+        num_workers=8,  # Adjusted num_workers
         collate_fn=eval_dataset.collate_fn,
         sampler=eval_sampler,
+        pin_memory=True,  # Added pin_memory
     )
 
     model.train()
