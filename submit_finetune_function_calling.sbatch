@@ -21,7 +21,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_DISTRIBUTED_TIMEOUT=600
 
 # Set container image path
-CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-torch2407:latest" # Updated for function calling
+CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest" # Updated for function calling
 echo "Using container image: $CONTAINER_IMAGE"
 
 # Define paths for job data and outputs on shared drive
@@ -37,7 +37,6 @@ chmod -R 777 "${JOB_DIR}"  # Ensure permissions
 
 # Container paths
 CONTAINER_JOB_DIR="/job_data" # This path is inside the container, referring to the mounted JOB_DIR
-# CONTAINER_DATA_PATH is not needed as function-finetune-fixed.py loads from HF datasets
 
 # Container mounts
 CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
@@ -49,6 +48,9 @@ FINETUNE_CLI_ARGS+=" --processed_dataset_path=/processed_datasets/glaive_fc_v2" 
 FINETUNE_CLI_ARGS+=" --use_qlora" # Enable QLoRA
 # FINETUNE_CLI_ARGS+=" --data_path=${CONTAINER_DATA_PATH}" # Removed for function calling script
 # FINETUNE_CLI_ARGS+=" --disable_amp"  # Keeping this for now
+export FINETUNE_CLI_ARGS
+
+echo "Finetune CLI args (before srun): $FINETUNE_CLI_ARGS" # For sbatch log
 
 # Node and rank configuration (same as chess_sbatch)
 HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
@@ -57,7 +59,7 @@ MASTER_PORT=29510 # Using the same default port
 
 echo "Head node: ${HEAD_NODE} (${HEAD_NODE_IP}:${MASTER_PORT})"
 echo "Container mounts: ${CONTAINER_MOUNTS}"
-echo "Finetune CLI args: $FINETUNE_CLI_ARGS"
+echo "Finetune CLI args (in main sbatch script): $FINETUNE_CLI_ARGS"
 
 # Write configuration files for nodes to read (same as chess_sbatch)
 echo "${HEAD_NODE}" > "${COORD_DIR}/master_addr.txt"
@@ -72,6 +74,10 @@ for i in "${!ALL_NODES[@]}"; do
 done
 chmod -R 755 "${COORD_DIR}"
 
+# Attempt to ensure filesystem changes are synced before srun
+sync
+sleep 5 
+
 # Launch the distributed training job
 echo "============================================================"
 echo "Launching distributed training on ${SLURM_NNODES} nodes"
@@ -85,30 +91,50 @@ srun \
     sh -c "
 # Get node information
 NODE_HOSTNAME=\$(hostname)
-NODE_LOG_FILE=\"${CONTAINER_JOB_DIR}/logs/\${NODE_HOSTNAME}.log\" # Log to mounted shared job dir
+# Construct NODE_LOG_FILE using CONTAINER_JOB_DIR which should be exported by srun --export=ALL
+# and was set to /job_data in the main sbatch script.
+# Ensure CONTAINER_JOB_DIR is correctly inherited, default to /job_data if empty for safety.
+EFFECTIVE_CONTAINER_JOB_DIR=\${CONTAINER_JOB_DIR:-/job_data}
+NODE_LOG_FILE=\"\${EFFECTIVE_CONTAINER_JOB_DIR}/logs/\${NODE_HOSTNAME}.log\"
 
+# Ensure log directory exists
+mkdir -p \"\$(dirname \"\$NODE_LOG_FILE\")\"
+
+# Initial log entries directly using constructed NODE_LOG_FILE
 echo \"==================== Node: \${NODE_HOSTNAME} ====================\" | tee \"\$NODE_LOG_FILE\"
 date | tee -a \"\$NODE_LOG_FILE\"
 
+# Define log function as in the original working script
 log() {
   echo \"\$@\" | tee -a \"\$NODE_LOG_FILE\"
 }
 
-MASTER_ADDR=\$(cat ${CONTAINER_JOB_DIR}/coord/master_ip.txt)
-MASTER_PORT=\$(cat ${CONTAINER_JOB_DIR}/coord/master_port.txt)
-WORLD_SIZE=\$(cat ${CONTAINER_JOB_DIR}/coord/world_size.txt)
+# Debug: Check if CONTAINER_JOB_DIR and FINETUNE_CLI_ARGS are available
+log \"DEBUG: Inherited CONTAINER_JOB_DIR is: '\${CONTAINER_JOB_DIR}'\"
+log \"DEBUG: EFFECTIVE_CONTAINER_JOB_DIR is: '\${EFFECTIVE_CONTAINER_JOB_DIR}'\"
+log \"DEBUG: Inherited FINETUNE_CLI_ARGS is: '\${FINETUNE_CLI_ARGS}'\"
+log \"DEBUG: NODE_LOG_FILE is: '\${NODE_LOG_FILE}'\"
+
+MASTER_ADDR=\$(cat \${EFFECTIVE_CONTAINER_JOB_DIR}/coord/master_ip.txt)
+MASTER_PORT=\$(cat \${EFFECTIVE_CONTAINER_JOB_DIR}/coord/master_port.txt)
+WORLD_SIZE=\$(cat \${EFFECTIVE_CONTAINER_JOB_DIR}/coord/world_size.txt)
 
 NODE_RANK=\"\"
+# Add check for node_ranks.txt existence
+if [ ! -f \"\${EFFECTIVE_CONTAINER_JOB_DIR}/coord/node_ranks.txt\" ]; then
+    log \"ERROR: \${EFFECTIVE_CONTAINER_JOB_DIR}/coord/node_ranks.txt not found!\"
+    exit 1
+fi
 while IFS=\": \" read -r host rank; do
     if [ \"\$host\" = \"\$NODE_HOSTNAME\" ]; then
         NODE_RANK=\$rank
         break
     fi
-done < \"${CONTAINER_JOB_DIR}/coord/node_ranks.txt\"
+done < \"\${EFFECTIVE_CONTAINER_JOB_DIR}/coord/node_ranks.txt\"
 
 if [ -z \"\$NODE_RANK\" ]; then
     log \"ERROR: Could not determine rank for node \${NODE_HOSTNAME}\"
-    cat \"${CONTAINER_JOB_DIR}/coord/node_ranks.txt\" | tee -a \"\$NODE_LOG_FILE\"
+    cat \"\${EFFECTIVE_CONTAINER_JOB_DIR}/coord/node_ranks.txt\" | tee -a \"\$NODE_LOG_FILE\"
     exit 1
 fi
 
@@ -121,6 +147,9 @@ log \"--- System Info ---\"
 nvidia-smi | tee -a \"\$NODE_LOG_FILE\"
 python --version | tee -a \"\$NODE_LOG_FILE\"
 pip list | grep torch | tee -a \"\$NODE_LOG_FILE\"
+pip list | grep peft | tee -a \"\$NODE_LOG_FILE\"
+pip list | grep bitsandbytes | tee -a \"\$NODE_LOG_FILE\"
+
 
 if [ \"\$NODE_RANK\" -ne \"0\" ]; then
     log \"Worker node waiting 30 seconds for head node to initialize...\"
@@ -128,6 +157,7 @@ if [ \"\$NODE_RANK\" -ne \"0\" ]; then
     log \"Worker node resuming\"
 fi
 
+# Export variables needed by the Python script within this sh -c context
 export MASTER_ADDR=\$MASTER_ADDR
 export MASTER_PORT=\$MASTER_PORT
 export WORLD_SIZE=\$WORLD_SIZE
@@ -135,7 +165,6 @@ export RANK=\$NODE_RANK
 export LOCAL_RANK=\$LOCAL_RANK
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
-# Set TOKENIZERS_PARALLELISM to false to avoid warnings/issues with fork
 export TOKENIZERS_PARALLELISM=false
 
 
@@ -143,10 +172,11 @@ log \"Starting PyTorch distributed training for function calling\"
 log \"ENV: RANK=\${RANK}, LOCAL_RANK=\${LOCAL_RANK}, WORLD_SIZE=\${WORLD_SIZE}\"
 
 # Define the target script path within the container
-TARGET_SCRIPT_PATH="/workspace/function-finetune-fixed.py"
+TARGET_SCRIPT_PATH=\"/workspace/function-finetune-fixed.py\"
 
 log \"Running training script \${TARGET_SCRIPT_PATH}\"
-log \"DEBUG: FINETUNE_CLI_ARGS before python call: \$FINETUNE_CLI_ARGS\"
+# FINETUNE_CLI_ARGS should be available here due to 'export FINETUNE_CLI_ARGS' in main script and srun --export=ALL
+log \"DEBUG: FINETUNE_CLI_ARGS (inside srun sh -c): \$FINETUNE_CLI_ARGS\"
 
 python \"\${TARGET_SCRIPT_PATH}\" \$FINETUNE_CLI_ARGS 2>&1 | tee -a \"\$NODE_LOG_FILE\"
 PYTHON_EXIT_CODE=\$?
