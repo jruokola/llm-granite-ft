@@ -3,10 +3,17 @@ docker push cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:l
 
 sftp -r ~/.ssh/id_ed25519 /Users/jokkeruokolainen/Documents/Personal/Nebius/llm-granite-ft root@89.169.103.66:/root/llm-granite-ft -m
 
-docker buildx build -t finetune-transformers:latest . -f=Dockerfile.function
+docker build -t finetune-transformers:latest . -f=Dockerfile.function
 
 docker save -o finetune-transformers_local.tar finetune-transformers:latest
 
 enroot import -o /root/finetune-transformers_local.sqsh docker-archive:/root/finetune-transformers_local.tar
 
 
+uv run python fixed-scripts/test_dataproc.py \                      ✘ 255 took  12m 44s  base  system at  17:14:57
+    --model_name_or_path "ibm-granite/granite-3.3-2b-instruct" \
+    --dataset_name "glaiveai/glaive-function-calling-v2" \
+    --dataset_data_file "glaive-function-calling-v2.json" \
+    --output_path "./glaive_fc_v2" \
+    --max_seq_length 2048 \
+    --num_samples_to_process -1 # Process all samples
