@@ -69,7 +69,6 @@ parser.add_argument("--max_seq_length", type=int, default=4096)
 # === LoRA / QLoRA ===
 parser.add_argument("--use_qlora", action="store_true")
 parser.add_argument("--lora_r", type=int, default=8)
-parser.add_argument("--use_fp8", type=bool, default=True)
 parser.add_argument("--lora_alpha", type=int, default=32)
 parser.add_argument("--lora_dropout", type=float, default=0.05)
 parser.add_argument("--lora_target_modules", default="q_proj,v_proj")
@@ -77,6 +76,7 @@ parser.add_argument("--lora_target_modules", default="q_proj,v_proj")
 parser.add_argument(
     "--use_fp8",
     action="store_true",
+    default="True",
     help="Enable FP8 layers via Transformer-Engine (H100 only)",
 )
 args = parser.parse_args()
