@@ -180,23 +180,18 @@ if args.no_fsdp:
     model = torch.nn.parallel.DistributedDataParallel(model.to(device))
 else:
     # --- define the policy ------------------------------------------------------
-    def skip_int8_modules(module: torch.nn.Module) -> bool:
-        """Return True (=wrap) only if the module contains NO int8 params."""
-        has_int8 = any(p.dtype == torch.int8 for p in module.parameters(recurse=False))
-        return not has_int8  # False → leave un-wrapped (no flatten)
+    def skip_if_int8(m):
+        """Wrap only if this module has no int8 params (so flattening is safe)."""
+        return not any(p.dtype == torch.int8 for p in m.parameters(recurse=False))
 
-    custom_policy = functools.partial(
-        lambda_auto_wrap_policy,
-        lambda_fn=skip_int8_modules,  # our filter above
-    )
+    auto_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=skip_if_int8)
 
-    # --- FSDP constructor --------------------------------------------------------
     model = FSDP(
-        model,  # your QLoRA + LoRA model
+        model,  # your QLoRA+LoRA model
         device_id=device,
-        auto_wrap_policy=custom_policy,  # <<< key line
+        auto_wrap_policy=auto_policy,
         sync_module_states=True,
-        use_orig_params=False,  # keep default flattening for float layers
+        # use_orig_params stays False (default) so wrapped FP modules ARE flattened
     )
 
 # ────────────────────────────────────────────────────────────────────────────
