@@ -500,9 +500,12 @@ if args.use_qlora:  # This is the line that needs to change
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
+        # Align compute_dtype with AMP: if AMP is float16, use float16.
+        # If AMP is disabled, bnb_config used float32, which is fine.
+        # The original script's AMP uses float16.
+        bnb_4bit_compute_dtype=torch.float16
         if not args.disable_amp
-        else torch.float32,  # bfloat16 for compute if AMP active
+        else torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
     # When using FSDP, device_map should ideally be handled by FSDP.
@@ -652,7 +655,13 @@ else:
 
     # Wrap model as FSDP model
     logger.info(f"Rank {torch.distributed.get_rank()}: Starting FSDP model wrapping...")
-    model = FSDP(model, device_id=device, auto_wrap_policy=auto_wrap_policy)
+    # Add sync_module_states=True for pre-modified models (like QLoRA)
+    model = FSDP(
+        model,
+        device_id=device,
+        auto_wrap_policy=auto_wrap_policy,
+        sync_module_states=True,
+    )
     logger.info(f"Rank {torch.distributed.get_rank()}: FSDP model wrapping complete.")
 
 # Create output directory (only on rank 0)
