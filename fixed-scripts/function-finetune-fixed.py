@@ -15,7 +15,6 @@ QLoRA + LoRA fine-tuning with FSDP for H100 (PyTorch 2.4).
 # 0   Standard libs
 # ────────────────────────────────────────────────────────────────────────────
 import argparse
-import functools
 import logging
 import math
 import os
@@ -31,7 +30,6 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
-from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -179,29 +177,12 @@ if args.use_fp8 and TE_AVAILABLE:
 if args.no_fsdp:
     model = torch.nn.parallel.DistributedDataParallel(model.to(device))
 else:
-
-    def subtree_contains_int8(module: torch.nn.Module) -> bool:
-        """Return True if *this module or any descendant* owns an int8 tensor."""
-        for p in module.parameters(recurse=True):
-            if p.dtype == torch.int8:
-                return True
-        return False
-
-    def safe_to_wrap(module: torch.nn.Module) -> bool:
-        """
-        Only wrap if entire subtree is free of int8 tensors.
-        That guarantees FSDP will never try to flatten an int8 weight.
-        """
-        return not subtree_contains_int8(module)
-
-    auto_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=safe_to_wrap)
-
     model = FSDP(
         model,
         device_id=device,
-        auto_wrap_policy=auto_policy,  # <-- new policy
+        auto_wrap_policy=None,  # 1 shard
         sync_module_states=True,
-        use_orig_params=False,  # keep default flatten inside safe blocks
+        use_orig_params=True,  # no flatten ⇒ int8 OK
     )
 
 # ────────────────────────────────────────────────────────────────────────────
