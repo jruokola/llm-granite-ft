@@ -179,19 +179,29 @@ if args.use_fp8 and TE_AVAILABLE:
 if args.no_fsdp:
     model = torch.nn.parallel.DistributedDataParallel(model.to(device))
 else:
-    # --- define the policy ------------------------------------------------------
-    def skip_if_int8(m):
-        """Wrap only if this module has no int8 params (so flattening is safe)."""
-        return not any(p.dtype == torch.int8 for p in m.parameters(recurse=False))
 
-    auto_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=skip_if_int8)
+    def subtree_contains_int8(module: torch.nn.Module) -> bool:
+        """Return True if *this module or any descendant* owns an int8 tensor."""
+        for p in module.parameters(recurse=True):
+            if p.dtype == torch.int8:
+                return True
+        return False
+
+    def safe_to_wrap(module: torch.nn.Module) -> bool:
+        """
+        Only wrap if entire subtree is free of int8 tensors.
+        That guarantees FSDP will never try to flatten an int8 weight.
+        """
+        return not subtree_contains_int8(module)
+
+    auto_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=safe_to_wrap)
 
     model = FSDP(
-        model,  # your QLoRA+LoRA model
+        model,
         device_id=device,
-        auto_wrap_policy=auto_policy,
+        auto_wrap_policy=auto_policy,  # <-- new policy
         sync_module_states=True,
-        # use_orig_params stays False (default) so wrapped FP modules ARE flattened
+        use_orig_params=False,  # keep default flatten inside safe blocks
     )
 
 # ────────────────────────────────────────────────────────────────────────────
