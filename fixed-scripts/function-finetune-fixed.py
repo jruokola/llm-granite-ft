@@ -34,6 +34,7 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
@@ -187,7 +188,7 @@ else:
     #       if p.dtype == torch.float32:
     #            p.data = p.data.to(torch.float16)
 
-    mp_policy = FSDP.MixedPrecision(
+    mp_policy = MixedPrecision(
         param_dtype=amp_dtype, reduce_dtype=amp_dtype, buffer_dtype=amp_dtype
     )
     model = FSDP(
