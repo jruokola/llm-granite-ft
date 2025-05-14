@@ -7,11 +7,12 @@ import subprocess
 import time
 
 import torch
-from datasets import load_dataset
-from peft import (  # , prepare_model_for_kbit_training # prepare_model_for_kbit_training might be needed for older peft
+from datasets import load_from_disk  # Added load_from_disk
+from peft import (
     LoraConfig,
     TaskType,
     get_peft_model,
+    prepare_model_for_kbit_training,  # prepare_model_for_kbit_training might be needed for older peft
 )
 from torch.amp import GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -127,326 +128,42 @@ parser.add_argument(
     default="q_proj,v_proj",  # Common for many models, adjust as needed
     help="Comma-separated list of module names to apply LoRA to (e.g., 'q_proj,v_proj').",
 )
+parser.add_argument(
+    "--processed_dataset_path",
+    type=str,
+    default=None,  # Required if not using on-the-fly processing
+    help="Path to the preprocessed dataset saved by test_dataproc.py.",
+)
 args = parser.parse_args()
 
 
-# Function calling dataset processor
-class FunctionCallingDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_length=2048, subset_size=-1):
-        self.tokenizer = tokenizer
-        # If a subset size is specified, take only that many examples
-        if subset_size > 0:
-            self.dataset = dataset.select(range(min(subset_size, len(dataset))))
+# Simplified Dataset class for preprocessed data
+class PreprocessedFunctionCallingDataset(Dataset):
+    def __init__(self, processed_dataset_split, subset_size=-1):
+        if subset_size > 0 and subset_size < len(processed_dataset_split):
+            self.dataset = processed_dataset_split.select(range(subset_size))
         else:
-            self.dataset = dataset
+            self.dataset = processed_dataset_split
 
-        self.max_length = max_length
-        # Set special tokens for the tokenizer
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Set format to PyTorch tensors for direct tensor output from __getitem__
+        self.dataset.set_format(
+            type="torch", columns=["input_ids", "attention_mask", "labels"]
+        )
 
-        # Print sample data to understand structure
         if len(self.dataset) > 0:
-            print(f"Dataset sample keys: {list(self.dataset[0].keys())}")
-            print(
-                f"Dataset sample first example chat content (first 200 chars): {self.dataset[0]['chat'][:200] if 'chat' in self.dataset[0] else None}"
+            logger.info(
+                f"Preprocessed dataset split loaded. Sample keys: {list(self.dataset[0].keys())}"
             )
+            logger.info(f"Sample input_ids shape: {self.dataset[0]['input_ids'].shape}")
 
     def __len__(self):
         return len(self.dataset)
 
-    def safe_process_message(self, message, idx=None):
-        """Process a single message safely without causing attribute errors."""
-        try:
-            if isinstance(message, dict):
-                # Handle dictionary message
-                role = ""
-                content = ""
-
-                # Safely get role and content
-                if "role" in message and isinstance(message["role"], str):
-                    role = message["role"].lower()
-                elif "role" in message:
-                    # Non-string role, convert to string
-                    role = str(message["role"]).lower()
-
-                if "content" in message and isinstance(message["content"], str):
-                    content = message["content"]
-                elif "content" in message:
-                    # Non-string content, convert to string
-                    content = str(message["content"])
-
-                # Format based on role
-                if role == "system":
-                    return f"<|system|>\n{content}\n"
-                elif role == "user":
-                    return f"<|user|>\n{content}\n"
-                elif role == "assistant":
-                    return f"<|assistant|>\n{content}\n"
-                else:
-                    # Unknown role, default to user
-                    return f"<|user|>\n{content}\n"
-            elif isinstance(message, str):
-                # Handle string message (default to user)
-                return f"<|user|>\n{message}\n"
-            elif isinstance(message, list):
-                # Handle list of messages recursively
-                result = ""
-                for submessage in message:
-                    result += self.safe_process_message(submessage, idx)
-                return result
-            else:
-                # Unknown type, convert to string and treat as user message
-                if idx is not None and idx < 3:
-                    print(f"Unknown message type: {type(message)} for example {idx}")
-                    print(f"Message content: {message}")
-                return f"<|user|>\n{str(message)}\n"
-        except Exception as e:
-            # Log any errors and return empty string
-            if idx is not None and idx < 3:
-                print(f"Error processing message: {str(e)}")
-                print(f"Message content: {message}")
-            return ""
-
     def __getitem__(self, idx):
-        try:
-            # Get the example from the dataset
-            example = self.dataset[idx]
+        return self.dataset[idx]  # Returns a dict of tensors
 
-            # Debug first few examples
-            if idx < 3:
-                print(f"Processing example {idx}")
-
-            # Initialize the formatted text
-            formatted_text = ""
-
-            # Handle system content if available
-            if "system" in example:
-                system_content = (
-                    str(example["system"]).strip()
-                    if example["system"] is not None
-                    else ""
-                )
-                if system_content:
-                    formatted_text += f"<|system|>\n{system_content}\n"
-
-            # Get chat content from various possible fields
-            chat_content = None
-            if "chat" in example and example["chat"] is not None:
-                chat_content = example["chat"]
-            elif "text" in example and example["text"] is not None:
-                chat_content = example["text"]
-            else:
-                # Fallback: use entire example as JSON string
-                chat_content = str(example)
-
-            # Process the chat content based on its type
-            if isinstance(chat_content, str):
-                # String content: process as conversation with markers
-                lines = chat_content.split("\n")
-                current_role = None
-                current_content = []
-
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # Check for role markers
-                    if line.startswith("SYSTEM:"):
-                        # Process previous role if any
-                        if current_role and current_content:
-                            role_content = "\n".join(current_content).strip()
-                            if current_role == "system":
-                                # Only add if not already added
-                                if not formatted_text.startswith("<|system|>"):
-                                    formatted_text += f"<|system|>\n{role_content}\n"
-                            elif current_role == "user":
-                                formatted_text += f"<|user|>\n{role_content}\n"
-                            elif current_role == "assistant":
-                                formatted_text += f"<|assistant|>\n{role_content}\n"
-
-                        # Start new system content
-                        current_role = "system"
-                        current_content = [line.replace("SYSTEM:", "").strip()]
-
-                    elif line.startswith("USER:"):
-                        # Process previous role if any
-                        if current_role and current_content:
-                            role_content = "\n".join(current_content).strip()
-                            if current_role == "system":
-                                # Only add if not already added
-                                if not formatted_text.startswith("<|system|>"):
-                                    formatted_text += f"<|system|>\n{role_content}\n"
-                            elif current_role == "user":
-                                formatted_text += f"<|user|>\n{role_content}\n"
-                            elif current_role == "assistant":
-                                formatted_text += f"<|assistant|>\n{role_content}\n"
-
-                        # Start new user content
-                        current_role = "user"
-                        current_content = [line.replace("USER:", "").strip()]
-
-                    elif line.startswith("A:"):
-                        # Process previous role if any
-                        if current_role and current_content:
-                            role_content = "\n".join(current_content).strip()
-                            if current_role == "system":
-                                # Only add if not already added
-                                if not formatted_text.startswith("<|system|>"):
-                                    formatted_text += f"<|system|>\n{role_content}\n"
-                            elif current_role == "user":
-                                formatted_text += f"<|user|>\n{role_content}\n"
-                            elif current_role == "assistant":
-                                formatted_text += f"<|assistant|>\n{role_content}\n"
-
-                        # Start new assistant content
-                        current_role = "assistant"
-                        current_content = [line.replace("A:", "").strip()]
-
-                    elif line.startswith("FUNCTION RESPONSE:"):
-                        # Special case for function responses
-                        if current_role == "assistant":
-                            # Function response is part of the assistant conversation
-                            current_content.append(line)
-                        else:
-                            # If not in an assistant message, start a new one
-                            if current_role and current_content:
-                                role_content = "\n".join(current_content).strip()
-                                if current_role == "system":
-                                    formatted_text += f"<|system|>\n{role_content}\n"
-                                elif current_role == "user":
-                                    formatted_text += f"<|user|>\n{role_content}\n"
-                                elif current_role == "assistant":
-                                    formatted_text += f"<|assistant|>\n{role_content}\n"
-
-                            current_role = "assistant"
-                            current_content = [line]
-                    else:
-                        # Continue with current role
-                        if current_role:
-                            current_content.append(line)
-                        else:
-                            # If no role defined yet, assume it's the system message
-                            current_role = "system"
-                            current_content = [line]
-
-                # Process the last role if any
-                if current_role and current_content:
-                    role_content = "\n".join(current_content).strip()
-                    if current_role == "system":
-                        # Only add if not already added
-                        if not formatted_text.startswith("<|system|>"):
-                            formatted_text += f"<|system|>\n{role_content}\n"
-                    elif current_role == "user":
-                        formatted_text += f"<|user|>\n{role_content}\n"
-                    elif current_role == "assistant":
-                        formatted_text += f"<|assistant|>\n{role_content}\n"
-
-            elif isinstance(chat_content, list):
-                # Debug content format for the first few examples
-                if idx < 3:
-                    print(
-                        f"Example {idx} has list chat_content with {len(chat_content)} items"
-                    )
-                    if len(chat_content) > 0:
-                        print(f"First item type: {type(chat_content[0])}")
-
-                # Handle list of messages using our safe processor
-                for message in chat_content:
-                    formatted_text += self.safe_process_message(message, idx)
-            else:
-                # Unknown content type, convert to string and add as user message
-                if idx < 3:
-                    print(
-                        f"Unknown chat_content type: {type(chat_content)} for example {idx}"
-                    )
-                formatted_text += f"<|user|>\n{str(chat_content)}\n"
-
-            # Remove special tokens if present
-            formatted_text = formatted_text.replace("<|endoftext|>", "")
-
-            # If we couldn't parse anything useful, provide a fallback
-            if not formatted_text:
-                formatted_text = (
-                    "<|user|>\nHello\n<|assistant|>\nHello! How can I help you today?\n"
-                )
-
-            # Debug the formatted text for the first few examples
-            if idx < 3:
-                print(
-                    f"Formatted text for example {idx} (sample): {formatted_text[:200]}..."
-                )
-
-            # Encode the formatted text
-            encodings = self.tokenizer(
-                formatted_text,
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
-            # Create the labels (same as input_ids but with -100 for non-assistant tokens)
-            input_ids = encodings.input_ids[0]
-            attention_mask = encodings.attention_mask[0]
-
-            # Create labels: -100 for non-assistant tokens, actual token ids for assistant tokens
-            labels = input_ids.clone()
-
-            # Find positions of <|assistant|> tokens to mask everything before them
-            assistant_positions = []
-            for i in range(len(input_ids) - 1):
-                token_pair = self.tokenizer.decode(input_ids[i : i + 2])
-                if "<|assistant|>" in token_pair:
-                    assistant_positions.append(i)
-
-            # Set labels to -100 for non-assistant parts
-            if assistant_positions:
-                in_assistant = False
-                for i in range(len(labels)):
-                    # Check if this is the start of an assistant section
-                    if i in assistant_positions:
-                        in_assistant = True
-                        # Skip the assistant token itself in the loss
-                        labels[i : i + 2] = -100
-                        continue
-
-                    # If not in assistant section, mask the token
-                    if not in_assistant:
-                        labels[i] = -100
-
-                    # Check if this is the end of an assistant section
-                    if in_assistant and i < len(labels) - 1:
-                        token_pair = self.tokenizer.decode(input_ids[i : i + 2])
-                        if "<|user|>" in token_pair or "<|system|>" in token_pair:
-                            in_assistant = False
-            else:
-                # If no assistant token found, don't compute loss on this example
-                labels[:] = -100
-
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
-        except Exception as e:
-            print(f"Error processing example {idx}: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
-            # Return a dummy example that won't affect training
-            dummy_ids = torch.zeros(self.max_length, dtype=torch.long)
-            dummy_mask = torch.zeros(self.max_length, dtype=torch.long)
-            dummy_labels = -100 * torch.ones(self.max_length, dtype=torch.long)
-            return {
-                "input_ids": dummy_ids,
-                "attention_mask": dummy_mask,
-                "labels": dummy_labels,
-            }
-
+    # Collate function remains the same as it expects a list of dicts of tensors
     def collate_fn(self, examples):
-        # This function is called by the DataLoader to collate multiple examples into a batch
-        # All examples are already padded to max_length, so we can just stack them
         batch = {
             "input_ids": torch.stack([example["input_ids"] for example in examples]),
             "attention_mask": torch.stack(
@@ -480,7 +197,7 @@ def train(model, train_dataset, eval_dataset, args):
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size_per_device,
-        num_workers=16,
+        num_workers=8,
         collate_fn=train_dataset.collate_fn,
         sampler=train_sampler,
     )
@@ -488,7 +205,7 @@ def train(model, train_dataset, eval_dataset, args):
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=args.batch_size_per_device,
-        num_workers=16,
+        num_workers=8,
         collate_fn=eval_dataset.collate_fn,
         sampler=eval_sampler,
     )
@@ -810,7 +527,9 @@ if args.use_qlora:  # This is the line that needs to change
     logger.info("Base model loaded in 4-bit for QLoRA.")
 
     # PEFT recommends this for QLoRA, though some parts might be handled by get_peft_model
-    # model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+    model = prepare_model_for_kbit_training(
+        model, use_gradient_checkpointing=args.gradient_checkpointing
+    )
     # logger.info("Model prepared for k-bit training.")
 
     # Define LoRA config
@@ -843,38 +562,76 @@ else:  # This is new
 
 
 # Load the dataset
-logger.info("Loading Function Calling dataset...")
-raw_dataset = load_dataset("glaiveai/glaive-function-calling-v2")
-logger.info(f"Dataset loaded. Size: {len(raw_dataset['train'])} examples")
+if args.processed_dataset_path:
+    logger.info(
+        f"Loading pre-processed dataset from disk: {args.processed_dataset_path}"
+    )
+    try:
+        processed_full_dataset = load_from_disk(args.processed_dataset_path)
+        logger.info(
+            f"Pre-processed dataset loaded. Total examples: {len(processed_full_dataset)}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to load preprocessed dataset from {args.processed_dataset_path}: {e}"
+        )
+        exit(1)
 
-# Create train and eval datasets
-train_size = int(0.9 * len(raw_dataset["train"]))
-eval_size = len(raw_dataset["train"]) - train_size
+    # Split into train and eval
+    # Assuming the loaded dataset from disk is the 'train' part that needs splitting
+    train_size = int(0.9 * len(processed_full_dataset))
+    eval_size = len(processed_full_dataset) - train_size
 
-# Split into train and eval
-train_dataset_raw = raw_dataset["train"].select(range(train_size))
-eval_dataset_raw = raw_dataset["train"].select(
-    range(train_size, train_size + eval_size)
-)
+    if train_size <= 0 or eval_size <= 0:
+        logger.error(
+            f"Dataset too small to split. Train size: {train_size}, Eval size: {eval_size}. Full dataset has {len(processed_full_dataset)} samples."
+        )
+        exit(1)
 
-logger.info(f"Train dataset size: {len(train_dataset_raw)}")
-logger.info(f"Eval dataset size: {len(eval_dataset_raw)}")
+    train_dataset_processed = processed_full_dataset.select(range(train_size))
+    eval_dataset_processed = processed_full_dataset.select(
+        range(
+            train_size, train_size + eval_size
+        )  # Corrected to use train_size + eval_size
+    )
+    logger.info(f"Train dataset size (from processed): {len(train_dataset_processed)}")
+    logger.info(f"Eval dataset size (from processed): {len(eval_dataset_processed)}")
 
-# Prepare datasets
-train_dataset = FunctionCallingDataset(
-    train_dataset_raw,
-    tokenizer,
-    max_length=args.max_seq_length,
-    subset_size=args.dataset_subset_size,
-)
-eval_dataset = FunctionCallingDataset(
-    eval_dataset_raw,
-    tokenizer,
-    max_length=args.max_seq_length,
-    subset_size=min(1000, len(eval_dataset_raw))
-    if args.dataset_subset_size > 0
-    else -1,
-)
+    train_dataset = PreprocessedFunctionCallingDataset(
+        train_dataset_processed,
+        subset_size=args.dataset_subset_size,  # Apply subset size if specified for training
+    )
+    eval_dataset = PreprocessedFunctionCallingDataset(
+        eval_dataset_processed,
+        subset_size=min(
+            1000, len(eval_dataset_processed)
+        )  # Limit eval subset for speed if main subset_size is active
+        if args.dataset_subset_size > 0
+        else -1,  # Or use all of eval_dataset_processed if no main subset_size
+    )
+
+else:
+    # Fallback to original on-the-fly processing if no processed_dataset_path is given
+    # This part would require the original FunctionCallingDataset class to be defined or imported.
+    # For this refactor, we'll assume processed_dataset_path is mandatory.
+    logger.error(
+        "Error: --processed_dataset_path is required. On-the-fly processing is disabled in this version."
+    )
+    logger.error(
+        "Please preprocess the data first using test_dataproc.py and provide the path."
+    )
+    exit(1)
+    # --- Code for on-the-fly processing would go here if we were to keep it ---
+    # logger.info("Loading Function Calling dataset for on-the-fly processing...")
+    # raw_dataset = load_dataset(
+    #     "glaiveai/glaive-function-calling-v2",
+    #     data_files={"train": "glaive-function-calling-v2.json"},
+    # )
+    # logger.info(f"Dataset loaded. Size: {len(raw_dataset['train'])} examples")
+    # ... (rest of original data loading and splitting) ...
+    # train_dataset = OriginalFunctionCallingDataset(...)
+    # eval_dataset = OriginalFunctionCallingDataset(...)
+
 
 if args.no_fsdp:
     # Move the model to the GPU and wrap model with DDP (no model sharding)

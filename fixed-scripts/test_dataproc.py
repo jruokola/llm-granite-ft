@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import time
 
 from datasets import load_dataset
@@ -11,265 +12,291 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Helper function to reconstruct text similar to FunctionCallingDataset ---
+# This is a simplified version of the original class's methods for direct use in .map()
 
-class FunctionCallingDatasetTester:
-    def __init__(self, dataset, tokenizer, max_length=2048, subset_size=-1):
-        self.tokenizer = tokenizer
-        if subset_size > 0:
-            self.dataset = dataset.select(range(min(subset_size, len(dataset))))
+
+def _safe_process_message_for_map(message_item):
+    """Processes a single message item (dict, str, list) for map function."""
+    if isinstance(message_item, dict):
+        role = str(message_item.get("role", "")).lower()
+        content = str(message_item.get("content", ""))
+        if role == "system":
+            return f"<|system|>\n{content}\n"
+        elif role == "user":
+            return f"<|user|>\n{content}\n"
+        elif role == "assistant":
+            return f"<|assistant|>\n{content}\n"
         else:
-            self.dataset = dataset
+            return f"<|user|>\n{content}\n"  # Default to user
+    elif isinstance(message_item, str):
+        return f"<|user|>\n{message_item}\n"
+    elif isinstance(message_item, list):
+        result = ""
+        for sub_message in message_item:
+            result += _safe_process_message_for_map(sub_message)
+        return result
+    return f"<|user|>\n{str(message_item)}\n"
 
-        self.max_length = max_length
-        self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if len(self.dataset) > 0:
-            logger.info(f"Dataset sample keys: {list(self.dataset[0].keys())}")
-            sample_chat = self.dataset[0].get(
-                "chat", self.dataset[0].get("text", str(self.dataset[0]))
-            )
-            logger.info(
-                f"Dataset sample first example content (first 200 chars): {sample_chat[:200] if isinstance(sample_chat, str) else str(sample_chat)[:200]}"
-            )
+def _flush_content_for_map(
+    current_role,
+    current_content_list,
+    formatted_text,
+    next_role=None,
+    next_content_line=None,
+    force_flush=False,
+):
+    if current_role and current_content_list:
+        role_content = "\n".join(current_content_list).strip()
+        if role_content:
+            if current_role == "system":
+                if not formatted_text.startswith("<|system|>"):  # Basic check
+                    formatted_text += f"<|system|>\n{role_content}\n"
+            elif current_role == "user":
+                formatted_text += f"<|user|>\n{role_content}\n"
+            elif current_role == "assistant":
+                formatted_text += f"<|assistant|>\n{role_content}\n"
 
-    def __len__(self):
-        return len(self.dataset)
+    if force_flush:
+        return None, [], formatted_text
 
-    def safe_process_message(self, message, idx=None):
-        """Process a single message safely without causing attribute errors."""
+    new_role = next_role
+    new_content_list = [next_content_line.strip()] if next_content_line else []
+    return new_role, new_content_list, formatted_text
+
+
+def _create_labels(input_ids_list, tokenizer):
+    """
+    Creates labels for language modeling, masking non-assistant parts.
+    input_ids_list: A list of token IDs.
+    tokenizer: The tokenizer instance.
+    """
+    labels = list(input_ids_list)  # Make a mutable copy
+
+    # Attempt to find assistant markers robustly
+    # This is tricky because special tokens can be tokenized into multiple IDs or be part of vocab
+    # The original script's method of decoding pairs is heuristic.
+    # A truly robust method would involve finding the exact token ID sequence for "<|assistant|>" etc.
+    # For now, we stick to a similar heuristic as the fine-tuning script for consistency.
+
+    assistant_marker_str = "<|assistant|>"
+    user_marker_str = "<|user|>"
+    system_marker_str = "<|system|>"
+
+    assistant_positions = []
+
+    # This simplified search might miss markers if they are split by the tokenizer in a way
+    # that `decode` on small windows doesn't reconstruct them.
+    # The original fine-tuning script decodes slices of 2 tokens.
+    # Let's try to emulate that, but be aware of its limitations.
+    for i in range(len(input_ids_list) - 1):  # Iterate up to the second to last token
+        # Decode a small window of tokens.
+        # Using skip_special_tokens=False to ensure markers are decoded if they are special.
+        # However, if they are not registered special tokens, this flag has no effect on them.
         try:
-            if isinstance(message, dict):
-                role = str(message.get("role", "")).lower()
-                content = str(message.get("content", ""))
-                if role == "system":
-                    return f"<|system|>\n{content}\n"
-                elif role == "user":
-                    return f"<|user|>\n{content}\n"
-                elif role == "assistant":
-                    return f"<|assistant|>\n{content}\n"
-                else:
-                    return f"<|user|>\n{content}\n"  # Default to user
-            elif isinstance(message, str):
-                return f"<|user|>\n{message}\n"
-            elif isinstance(message, list):
-                result = ""
-                for submessage in message:
-                    result += self.safe_process_message(submessage, idx)
-                return result
-            else:
-                if (
-                    idx is not None and idx < 3
-                ):  # Log only for first few problematic ones
-                    logger.warning(
-                        f"Unknown message type: {type(message)} for example {idx}. Content: {message}"
+            # It's important that tokenizer.decode can handle arbitrary slices.
+            # Some tokenizers might expect complete sequences or valid UTF-8.
+            decoded_slice = tokenizer.decode(
+                input_ids_list[i : i + 2], skip_special_tokens=False
+            )
+        except:  # Broad except as tokenizer internals can vary
+            decoded_slice = ""
+
+        if assistant_marker_str in decoded_slice:
+            # This position 'i' is where the assistant marker *starts* or is detected within this window.
+            assistant_positions.append(i)
+
+    if assistant_positions:
+        in_assistant_segment = False
+        # Mask tokens up to the first assistant token, and the assistant token itself.
+        # Then, unmask tokens until a new user/system token or end of sequence.
+
+        # More direct approach: iterate tokens, switch state, mask accordingly.
+        current_pos = 0
+        while current_pos < len(labels):
+            is_assistant_start = False
+            # Check if current_pos is one of the identified assistant_positions
+            # This check needs to be robust to multi-token markers.
+            # The original logic was: if i in assistant_positions: labels[i:i+2] = -100
+            # This implies the marker is roughly 2 tokens.
+
+            # Let's try to find the *actual* assistant marker tokens and mask them.
+            # This is still heuristic without knowing the exact token IDs of markers.
+
+            # Simplified logic based on the original script's intent:
+            # Mask everything that is not explicitly part of an assistant's response.
+
+            temp_in_assistant = False
+            for i in range(len(labels)):
+                # Try to detect start of assistant turn
+                if i in assistant_positions:  # Heuristic: marker starts at i
+                    temp_in_assistant = True
+                    # Mask the marker itself (assuming 2 tokens for simplicity like original)
+                    labels[i] = -100
+                    if i + 1 < len(labels):
+                        labels[i + 1] = -100
+                    continue  # Move to token after marker
+
+                if not temp_in_assistant:
+                    labels[i] = -100
+                else:  # We are in an assistant turn
+                    # Check for end of assistant turn (start of user/system)
+                    # This also needs robust detection of user/system markers
+                    is_user_or_system_marker = False
+                    if i + 1 < len(labels):
+                        try:
+                            decoded_slice_end = tokenizer.decode(
+                                input_ids_list[i : i + 2], skip_special_tokens=False
+                            )
+                        except:
+                            decoded_slice_end = ""
+                        if (
+                            user_marker_str in decoded_slice_end
+                            or system_marker_str in decoded_slice_end
+                        ):
+                            is_user_or_system_marker = True
+
+                    if is_user_or_system_marker:
+                        temp_in_assistant = False
+                        labels[i] = -100  # Mask the user/system marker
+                        if i + 1 < len(labels):
+                            labels[i + 1] = -100
+            break  # Broke out of the while current_pos loop, used temp_in_assistant logic instead
+
+    else:  # No assistant token found
+        for i in range(len(labels)):
+            labels[i] = -100
+
+    return labels
+
+
+def preprocess_example(example, tokenizer, max_length):
+    """
+    Processes a single raw example from the dataset into tokenized form
+    with input_ids, attention_mask, and labels.
+    """
+    idx = example.get("_idx_internal", None)  # If we add an index during enumeration
+
+    formatted_text = ""
+    # System message
+    if "system" in example and example["system"] is not None:
+        system_content = str(example["system"]).strip()
+        if system_content:
+            formatted_text += f"<|system|>\n{system_content}\n"
+
+    # Chat content
+    chat_content = example.get("chat", example.get("text", str(example)))
+
+    if isinstance(chat_content, str):
+        lines = chat_content.split("\n")
+        current_role = None
+        current_content_list = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            new_role_detected = False
+            if line.startswith("SYSTEM:"):
+                current_role, current_content_list, formatted_text = (
+                    _flush_content_for_map(
+                        current_role,
+                        current_content_list,
+                        formatted_text,
+                        "system",
+                        line.replace("SYSTEM:", "").strip(),
                     )
-                return f"<|user|>\n{str(message)}\n"
-        except Exception as e:
-            if idx is not None and idx < 3:
-                logger.error(
-                    f"Error processing message for example {idx}: {str(e)}. Content: {message}"
                 )
-            return ""
-
-    def __getitem__(self, idx):
-        start_time = time.time()
-        raw_example_content = ""
-        formatted_text_len = 0
-        input_ids_len = 0
-        formatted_text_snippet = ""
-
-        try:
-            example = self.dataset[idx]
-            formatted_text = ""
-
-            if "system" in example and example["system"] is not None:
-                system_content = str(example["system"]).strip()
-                if system_content:
-                    formatted_text += f"<|system|>\n{system_content}\n"
-
-            chat_content = None
-            if "chat" in example and example["chat"] is not None:
-                chat_content = example["chat"]
-            elif "text" in example and example["text"] is not None:
-                chat_content = example["text"]
-            else:
-                chat_content = str(example)  # Fallback
-
-            raw_example_content = str(chat_content)
-
-            if isinstance(chat_content, str):
-                lines = chat_content.split("\n")
-                current_role = None
-                current_content = []
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    new_role_detected = False
-                    if line.startswith("SYSTEM:"):
-                        current_role, current_content, formatted_text = (
-                            self._flush_content_to_formatted_text(
-                                current_role,
-                                current_content,
-                                formatted_text,
-                                "system",
-                                line.replace("SYSTEM:", "").strip(),
-                            )
-                        )
-                        new_role_detected = True
-                    elif line.startswith("USER:"):
-                        current_role, current_content, formatted_text = (
-                            self._flush_content_to_formatted_text(
-                                current_role,
-                                current_content,
-                                formatted_text,
-                                "user",
-                                line.replace("USER:", "").strip(),
-                            )
-                        )
-                        new_role_detected = True
-                    elif line.startswith("A:"):
-                        current_role, current_content, formatted_text = (
-                            self._flush_content_to_formatted_text(
-                                current_role,
-                                current_content,
-                                formatted_text,
-                                "assistant",
-                                line.replace("A:", "").strip(),
-                            )
-                        )
-                        new_role_detected = True
-                    elif line.startswith("FUNCTION RESPONSE:"):
-                        if current_role == "assistant":
-                            current_content.append(line)
-                        else:  # If not in assistant, start new assistant message
-                            current_role, current_content, formatted_text = (
-                                self._flush_content_to_formatted_text(
-                                    current_role,
-                                    current_content,
-                                    formatted_text,
-                                    "assistant",
-                                    line,
-                                )
-                            )
-                        new_role_detected = True  # Treat as role boundary for logic
-
-                    if not new_role_detected:
-                        if current_role:
-                            current_content.append(line)
-                        else:  # Default to system if no role marker seen yet
-                            current_role = "system"
-                            current_content = [line]
-
-                # Flush any remaining content
-                _, _, formatted_text = self._flush_content_to_formatted_text(
-                    current_role,
-                    current_content,
-                    formatted_text,
-                    None,
-                    None,
-                    force_flush=True,
+                new_role_detected = True
+            elif line.startswith("USER:"):
+                current_role, current_content_list, formatted_text = (
+                    _flush_content_for_map(
+                        current_role,
+                        current_content_list,
+                        formatted_text,
+                        "user",
+                        line.replace("USER:", "").strip(),
+                    )
                 )
-
-            elif isinstance(chat_content, list):
-                for message in chat_content:
-                    formatted_text += self.safe_process_message(message, idx)
-            else:  # Unknown type
-                formatted_text += f"<|user|>\n{str(chat_content)}\n"
-
-            formatted_text = formatted_text.replace("<|endoftext|>", "")
-            if not formatted_text.strip():
-                formatted_text = (
-                    "<|user|>\nHello\n<|assistant|>\nHello! How can I help you today?\n"
+                new_role_detected = True
+            elif line.startswith("A:"):  # Assuming 'A:' is Assistant
+                current_role, current_content_list, formatted_text = (
+                    _flush_content_for_map(
+                        current_role,
+                        current_content_list,
+                        formatted_text,
+                        "assistant",
+                        line.replace("A:", "").strip(),
+                    )
                 )
+                new_role_detected = True
+            elif line.startswith("FUNCTION RESPONSE:"):
+                if current_role == "assistant":
+                    current_content_list.append(line)
+                else:
+                    current_role, current_content_list, formatted_text = (
+                        _flush_content_for_map(
+                            current_role,
+                            current_content_list,
+                            formatted_text,
+                            "assistant",
+                            line,
+                        )
+                    )
+                new_role_detected = True  # Treat as boundary
 
-            formatted_text_len = len(formatted_text)
-            formatted_text_snippet = formatted_text[:200].replace("\n", "\\n") + "..."
+            if not new_role_detected:
+                if current_role:
+                    current_content_list.append(line)
+                else:  # Default if no role seen yet
+                    current_role = "system"
+                    current_content_list = [line]
 
-            # Tokenization (not returning PyTorch tensors)
-            # Using return_tensors=None (default) or "np" would avoid torch dependency here.
-            # For simplicity, let's assume the tokenizer can handle it or this part might be slow.
-            encodings = self.tokenizer(
-                formatted_text,
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",  # This might be slow if not needed for pure speed test of processing
-                return_attention_mask=True,  # Ensure attention_mask is returned
-            )
-            input_ids = encodings["input_ids"]
-            # attention_mask = encodings["attention_mask"] # Available if needed
-            input_ids_len = len(input_ids)
+        # Flush any remaining content
+        _, _, formatted_text = _flush_content_for_map(
+            current_role, current_content_list, formatted_text, force_flush=True
+        )
 
-            processing_time = time.time() - start_time
-            return {
-                "idx": idx,
-                "processing_time_seconds": processing_time,
-                "raw_content_len": len(raw_example_content),
-                "formatted_text_len": formatted_text_len,
-                "formatted_text_snippet": formatted_text_snippet,
-                "input_ids_len": input_ids_len,
-                "error": None,
-            }
+    elif isinstance(chat_content, list):
+        for message_item in chat_content:
+            formatted_text += _safe_process_message_for_map(message_item)
+    else:
+        formatted_text += f"<|user|>\n{str(chat_content)}\n"
 
-        except Exception as e:
-            import traceback
+    formatted_text = formatted_text.replace("<|endoftext|>", "")
+    if not formatted_text.strip():
+        formatted_text = (
+            "<|user|>\nHello\n<|assistant|>\nHello! How can I help you today?\n"
+        )
 
-            logger.error(
-                f"Critical error in __getitem__ for example {idx}: {str(e)}\n{traceback.format_exc()}"
-            )
-            processing_time = time.time() - start_time
-            return {
-                "idx": idx,
-                "processing_time_seconds": processing_time,
-                "raw_content_len": len(
-                    raw_example_content
-                ),  # Might be 0 if error early
-                "formatted_text_len": formatted_text_len,
-                "formatted_text_snippet": "ERROR DURING PROCESSING",
-                "input_ids_len": input_ids_len,
-                "error": str(e),
-            }
-
-    def _flush_content_to_formatted_text(
-        self,
-        current_role,
-        current_content_list,
+    # Tokenize
+    # Ensure pad_token is set on the tokenizer instance passed to this function
+    # tokenizer.pad_token = tokenizer.eos_token (should be done outside, once)
+    encodings = tokenizer(
         formatted_text,
-        next_role=None,
-        next_content_line=None,
-        force_flush=False,
-    ):
-        if current_role and current_content_list:
-            role_content = "\n".join(current_content_list).strip()
-            if role_content:  # Only add if there's actual content
-                if current_role == "system":
-                    # Add system message only if it's not already the start of formatted_text
-                    # This check might be too simplistic if system messages can appear later.
-                    # For now, assuming one leading system message or system messages are distinctly marked.
-                    if not formatted_text.startswith("<|system|>"):
-                        formatted_text += f"<|system|>\n{role_content}\n"
-                    # If it is already there, and this is a new system block, it implies multiple system messages.
-                    # The current logic might merge them or add duplicates if not careful.
-                    # For simplicity, let's assume distinct blocks are fine.
-                    # else: # formatted_text.startswith("<|system|>")
-                    #    formatted_text += f"<|system|>\n{role_content}\n" # Allow multiple system blocks if needed
-                elif current_role == "user":
-                    formatted_text += f"<|user|>\n{role_content}\n"
-                elif current_role == "assistant":
-                    formatted_text += f"<|assistant|>\n{role_content}\n"
+        max_length=max_length,
+        truncation=True,
+        padding="max_length",  # Pad to max_length for consistent tensor shapes
+        return_attention_mask=True,
+    )
 
-        if force_flush:
-            return None, [], formatted_text  # Reset role and content
+    input_ids = encodings["input_ids"]
+    attention_mask = encodings["attention_mask"]
 
-        # Start new role and content
-        new_role = next_role
-        new_content_list = [next_content_line.strip()] if next_content_line else []
-        return new_role, new_content_list, formatted_text
+    # Create labels
+    labels = _create_labels(input_ids, tokenizer)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Test data processing for FunctionCallingDataset."
+        description="Preprocess FunctionCallingDataset and save to disk."
     )
     parser.add_argument(
         "--model_name_or_path",
@@ -278,10 +305,28 @@ if __name__ == "__main__":
         help="Tokenizer model name or path.",
     )
     parser.add_argument(
-        "--num_samples",
+        "--dataset_name",
+        type=str,
+        default="glaiveai/glaive-function-calling-v2",
+        help="Name of the dataset on Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--dataset_data_file",
+        type=str,
+        default="glaive-function-calling-v2.json",  # Confirmed by user
+        help="Specific data file within the dataset (e.g., json, jsonl).",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        required=True,
+        help="Path to save the processed dataset.",
+    )
+    parser.add_argument(
+        "--num_samples_to_process",
         type=int,
-        default=10,
-        help="Number of samples to test from the dataset.",
+        default=-1,
+        help="Number of samples to process and save. -1 for all samples.",
     )
     parser.add_argument(
         "--max_seq_length",
@@ -289,65 +334,90 @@ if __name__ == "__main__":
         default=2048,
         help="Maximum sequence length for tokenization.",
     )
+    parser.add_argument(
+        "--num_proc",
+        type=int,
+        default=None,  # os.cpu_count(),
+        help="Number of processes to use for .map(). Defaults to all available CPUs.",
+    )
     script_args = parser.parse_args()
+
+    if script_args.num_proc is None:
+        script_args.num_proc = os.cpu_count()
+        logger.info(f"Using {script_args.num_proc} processes for dataset mapping.")
 
     logger.info(f"Loading tokenizer: {script_args.model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_name_or_path, trust_remote_code=True
     )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.info(
+            f"Set tokenizer.pad_token to tokenizer.eos_token: {tokenizer.eos_token}"
+        )
 
-    logger.info("Loading dataset: glaiveai/glaive-function-calling-v2")
-    # Load only the 'train' split as that's what the original script uses primarily
+    logger.info(f"Loading raw dataset: {script_args.dataset_name}")
     try:
-        raw_dataset_full = load_dataset("glaiveai/glaive-function-calling-v2")
-        # Assuming 'train' split exists, if not, this will error.
-        # The original script splits this further, but for testing __getitem__ on raw data,
-        # using a portion of the 'train' split directly is fine.
-        raw_dataset = raw_dataset_full["train"]
+        # Load the specific data file for the 'train' split
+        raw_dataset_dict = load_dataset(
+            script_args.dataset_name,
+            data_files={"train": script_args.dataset_data_file},
+        )
+        if "train" not in raw_dataset_dict:
+            logger.error(
+                f"'train' split not found in loaded dataset. Available splits: {list(raw_dataset_dict.keys())}"
+            )
+            exit(1)
+        raw_dataset_train = raw_dataset_dict["train"]
     except Exception as e:
         logger.error(f"Failed to load dataset: {e}")
+        import traceback
+
+        traceback.print_exc()
         exit(1)
 
-    logger.info(f"Dataset loaded. Total examples in 'train' split: {len(raw_dataset)}")
+    logger.info(f"Raw 'train' dataset loaded. Total examples: {len(raw_dataset_train)}")
 
-    # Use only a subset for testing if num_samples is less than dataset size
-    num_to_process = min(script_args.num_samples, len(raw_dataset))
-    if num_to_process < script_args.num_samples:
+    if (
+        script_args.num_samples_to_process > 0
+        and script_args.num_samples_to_process < len(raw_dataset_train)
+    ):
+        raw_dataset_subset = raw_dataset_train.select(
+            range(script_args.num_samples_to_process)
+        )
+        logger.info(f"Processing a subset of {len(raw_dataset_subset)} samples.")
+    else:
+        raw_dataset_subset = raw_dataset_train
         logger.info(
-            f"Requested {script_args.num_samples} samples, but dataset split has only {len(raw_dataset)}. Processing {num_to_process} samples."
+            f"Processing all {len(raw_dataset_subset)} samples from 'train' split."
         )
 
-    dataset_tester = FunctionCallingDatasetTester(
-        raw_dataset,  # Pass the selected split
-        tokenizer,
-        max_length=script_args.max_seq_length,
-        subset_size=num_to_process,  # Process only the requested number of samples
+    # Prepare for mapping
+    # The `preprocess_example` function needs `tokenizer` and `max_length`.
+    # We can pass these using `fn_kwargs` in the `.map()` call.
+
+    logger.info(
+        f"Starting dataset preprocessing with {script_args.num_proc} processes..."
+    )
+    start_map_time = time.time()
+
+    processed_dataset = raw_dataset_subset.map(
+        preprocess_example,
+        fn_kwargs={"tokenizer": tokenizer, "max_length": script_args.max_seq_length},
+        num_proc=script_args.num_proc,
+        remove_columns=raw_dataset_subset.column_names,  # Remove old columns to keep only processed ones
     )
 
-    # Corrected loop to use the length of the dataset_tester instance
-    # which already considers the subset_size
-    actual_samples_to_test = len(dataset_tester)
-    logger.info(f"Processing {actual_samples_to_test} samples...")
+    map_duration = time.time() - start_map_time
+    logger.info(f"Dataset preprocessing finished in {map_duration:.2f} seconds.")
 
-    total_time = 0
-    for i in range(actual_samples_to_test):
-        logger.info(f"--- Processing sample index: {i} ---")
-        metrics = dataset_tester[i]
-        total_time += metrics["processing_time_seconds"]
-        logger.info(f"  Time taken: {metrics['processing_time_seconds']:.4f} seconds")
-        logger.info(f"  Raw content length: {metrics['raw_content_len']}")
-        logger.info(f"  Formatted text length: {metrics['formatted_text_len']}")
-        logger.info(f"  Formatted text snippet: {metrics['formatted_text_snippet']}")
-        logger.info(f"  Input IDs length: {metrics['input_ids_len']}")
-        if metrics["error"]:
-            logger.error(f"  Error for sample {i}: {metrics['error']}")
+    # Set format to PyTorch tensors for easier loading in the training script
+    # processed_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    # Saving to disk in Arrow format is generally fine; set_format can be done after loading.
 
-    if actual_samples_to_test > 0:
-        logger.info("--- Summary ---")
-        logger.info(f"Processed {actual_samples_to_test} samples.")
-        logger.info(f"Total processing time: {total_time:.4f} seconds.")
-        logger.info(
-            f"Average time per sample: {total_time / actual_samples_to_test:.4f} seconds."
-        )
-    else:
-        logger.info("No samples were processed.")
+    logger.info(f"Saving processed dataset to {script_args.output_path}...")
+    start_save_time = time.time()
+    processed_dataset.save_to_disk(script_args.output_path)
+    save_duration = time.time() - start_save_time
+    logger.info(f"Processed dataset saved in {save_duration:.2f} seconds.")
+    logger.info("--- Preprocessing Complete ---")

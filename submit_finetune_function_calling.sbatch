@@ -45,6 +45,8 @@ CONTAINER_MOUNTS="${JOB_DIR}:${CONTAINER_JOB_DIR}"
 # Training arguments
 FINETUNE_CLI_ARGS=""
 FINETUNE_CLI_ARGS+=" --output_dir=${CONTAINER_JOB_DIR}/checkpoints"
+FINETUNE_CLI_ARGS+=" --processed_dataset_path=/processed_datasets/glaive_fc_v2" # Path inside the Docker container
+FINETUNE_CLI_ARGS+=" --use_qlora" # Enable QLoRA
 # FINETUNE_CLI_ARGS+=" --data_path=${CONTAINER_DATA_PATH}" # Removed for function calling script
 # FINETUNE_CLI_ARGS+=" --disable_amp"  # Keeping this for now
 
