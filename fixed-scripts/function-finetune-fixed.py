@@ -30,8 +30,13 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from torch.amp import GradScaler
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+)
+from torch.distributed.fsdp import (
+    MixedPrecision,
+    StateDictType,
+)
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
@@ -200,12 +205,22 @@ if not args.no_fsdp:
     # torch.compile only if available (PT>=2.1) and not inside TE context.
     if hasattr(torch, "compile"):
         model = torch.compile(model, backend="inductor", mode="max-autotune")
+
+    # Define the mixed precision policy for FSDP
+    # This aligns FSDP's parameter dtype with the script's amp_dtype
+    mixed_precision_policy = MixedPrecision(
+        param_dtype=amp_dtype,
+        reduce_dtype=amp_dtype,  # Dtype for gradient reduction
+        buffer_dtype=amp_dtype,  # Dtype for buffers
+    )
+
     model = FSDP(
         model,
         device_id=device,
         use_orig_params=True,
         ignored_modules=int8_mods,
         sync_module_states=True,
+        mixed_precision=mixed_precision_policy,
     )
 else:
     model = torch.nn.parallel.DistributedDataParallel(
