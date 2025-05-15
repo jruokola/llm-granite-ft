@@ -11,8 +11,6 @@
 #SBATCH --time=23:59:00                           # wall-clock limit
 #SBATCH --output=/root/slurm_logs/function_finetune_%j.log
 #SBATCH --export=ALL
-#SBATCH --kill-on-bad-exit=1                      # cancel job if any task dies   [oai_citation:0‡slurm.schedmd.com](https://slurm.schedmd.com/srun.html?utm_source=chatgpt.com)
-
 ###############################################################################
 # 0.  Cluster / container constants
 ###############################################################################
