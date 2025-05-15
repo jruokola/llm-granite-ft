@@ -160,9 +160,7 @@ def fp8_ctx():
 if args.use_fp8 and TE_OK:
     for n, m in model.named_modules():
         if "lora_" in n and isinstance(m, torch.nn.Linear):
-            repl = te.Linear(
-                m.in_features, m.out_features, bias=m.bias is not None, fp8=True
-            )
+            repl = te.Linear(m.in_features, m.out_features, bias=m.bias)
             repl.weight.data.copy_(m.weight.data)
             parent, child = n.rsplit(".", 1)
             setattr(eval("model." + parent), child, repl)
