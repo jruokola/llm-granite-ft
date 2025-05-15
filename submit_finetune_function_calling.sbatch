@@ -37,8 +37,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1                # fewer GPU peer queues impr
 export TORCH_DISTRIBUTED_TIMEOUT=600                # 10 min rendez-vous timeout  [oai_citation:7‡PyTorch Forums](https://discuss.pytorch.org/t/distributeddataparallel-socket-timeout/174192?utm_source=chatgpt.com)
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}       # use all allocated CPU cores
 export HF_DATASETS_CACHE="/job_data/hf_cache"       # keep cache on fast SSD  [oai_citation:8‡Hugging Face](https://huggingface.co/docs/datasets/cache?utm_source=chatgpt.com)
-export FLASH_ATTENTION_FORCE=1                      # ensure FA2 kernels on H100  [oai_citation:9‡manpages.ubuntu.com](https://manpages.ubuntu.com/manpages/trusty/man1/srun.1.html?utm_source=chatgpt.com)
-
+export FLASH_ATTENTION_FORCE_CUDA=1
 ###############################################################################
 # 2.  Build CLI for the fine-tune script (passed unchanged to torchrun)
 ###############################################################################
