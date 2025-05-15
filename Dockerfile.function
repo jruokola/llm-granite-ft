@@ -26,7 +26,8 @@ RUN python3 -m pip install --upgrade pip setuptools wheel && \
         huggingface_hub[hf_xet] \
         accelerate \
         bitsandbytes \
-        transformer_engine
+        transformer_engine \
+        contextlib
 
 # 4 — Copy training code and data
 COPY fixed-scripts/function-finetune-fixed.py .
