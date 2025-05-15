@@ -157,13 +157,37 @@ def fp8_ctx():
     return nullcontext()
 
 
+# Replace LoRA adapters with FP8 Transformer-Engine layers, avoiding eval()
 if args.use_fp8 and TE_OK:
-    for n, m in model.named_modules():
-        if "lora_" in n and isinstance(m, torch.nn.Linear):
-            repl = te.Linear(m.in_features, m.out_features, bias=m.bias)
-            repl.weight.data.copy_(m.weight.data)
-            parent, child = n.rsplit(".", 1)
-            setattr(eval("model." + parent), child, repl)
+    for name, mod in model.named_modules():
+        if "lora_" in name and isinstance(mod, torch.nn.Linear):
+            # create a new FP8-enabled layer
+            repl = te.Linear(
+                mod.in_features,
+                mod.out_features,
+                bias=(mod.bias is not None),
+            )
+            # copy over the trained weights
+            repl.weight.data.copy_(mod.weight.data)
+
+            # split the full module path into parts
+            # e.g. "base_model.model.layers.0.self_attn.q_proj"
+            parts = name.split(".")
+            child_name = parts[-1]
+            parent_parts = parts[:-1]
+
+            # walk down from `model` to the parent module
+            parent_mod = model
+            for p in parent_parts:
+                if p.isdigit():
+                    # numeric index into a ModuleList or list
+                    parent_mod = parent_mod[int(p)]
+                else:
+                    parent_mod = getattr(parent_mod, p)
+
+            # set the new FP8 layer in place of the old Linear
+            setattr(parent_mod, child_name, repl)
+
     log.info("LoRA adapters swapped to FP8 TE layers.")
 
 # ──────── FSDP (single shard → ignore int8 safely) ─────────
