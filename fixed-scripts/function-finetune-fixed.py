@@ -28,7 +28,6 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training,
 )
-from torch.amp import GradScaler  # Re-add GradScaler import
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
 )
@@ -138,27 +137,27 @@ tok = AutoTokenizer.from_pretrained(
 )
 
 # Configure amp_dtype and GradScaler based on args
+scaler = (
+    None  # Initialize scaler to None, GradScaler will be disabled for all AMP paths now
+)
 if args.disable_amp:
     amp_dtype = torch.float32
-    scaler = None
+    # scaler is already None
     if rank == 0:
         print("[INFO] AMP disabled. Training in FP32.")
         sys.stdout.flush()
 else:  # AMP is enabled
     if not args.use_fp8:
-        # FP8 is NOT used: prefer bfloat16 and try GradScaler
+        # FP8 is NOT used: prefer bfloat16. GradScaler is disabled.
         amp_dtype = torch.bfloat16
-        scaler = (
-            GradScaler()
-        )  # This might hit the RuntimeError with certain PyTorch versions
         if rank == 0:
-            print(f"[INFO] AMP enabled with {amp_dtype} and GradScaler (FP8 disabled).")
+            print(
+                f"[INFO] AMP enabled with {amp_dtype} (FP8 disabled). GradScaler is disabled."
+            )
             sys.stdout.flush()
     else:
-        # FP8 IS used: stick to float16 (due to FP8 conversion preferences)
-        # and no GradScaler (due to FSDP+FP16 params not needing it / causing errors)
+        # FP8 IS used: stick to float16. GradScaler is disabled.
         amp_dtype = torch.float16
-        scaler = None
         if rank == 0:
             print(
                 f"[INFO] AMP enabled with {amp_dtype} (FP8 enabled). GradScaler is disabled."

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import sys  # Re-add sys import
 
 from datasets import Dataset, Features, Sequence, Value
 from transformers import AutoTokenizer
@@ -14,6 +15,23 @@ TOOL_CALL_MARKER_GRANITE = "<|tool_call|>"
 
 ROLE_SYSTEM_GRANITE = "system"
 ROLE_AVAILABLE_TOOLS_GRANITE = "available_tools"
+
+
+# Helper print functions (defined early)
+def print_rank0(*args, **kwargs):
+    # Simple print for non-distributed script, or for rank 0 if run in such context
+    if int(os.getenv("RANK", "0")) == 0:
+        print(*args, **kwargs)
+        if "file" not in kwargs or kwargs["file"] == sys.stdout:
+            sys.stdout.flush()
+
+
+def eprint_rank0(*args, **kwargs):
+    if int(os.getenv("RANK", "0")) == 0:
+        print(*args, file=sys.stderr, **kwargs)
+        sys.stderr.flush()
+
+
 ROLE_USER_GRANITE = "user"
 ROLE_ASSISTANT_GRANITE = "assistant"
 ROLE_TOOL_RESPONSE_GRANITE = "tool_response"

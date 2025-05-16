@@ -20,6 +20,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset_path",
         type=str,
+        default="../glaive_fc_v2",
         required=True,
         help="Path to the processed dataset directory (saved by save_to_disk).",
     )
