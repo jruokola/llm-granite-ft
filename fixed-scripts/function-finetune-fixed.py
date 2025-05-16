@@ -425,6 +425,12 @@ for ep in range(args.num_epochs):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.autocast("cuda", amp_dtype) if scaler else nullcontext(), fp8_ctx():
             loss = model(**batch).loss / args.gradient_accumulation_steps
+            if rank == 0:  # Or check on all ranks if preferred
+                if torch.isinf(loss).any() or torch.isnan(loss).any():
+                    print(
+                        f"[ERROR] Rank {rank} - Loss became inf/nan BEFORE backward: {loss.item()}",
+                        file=sys.stderr,
+                    )
 
         if scaler:
             scaler.scale(loss).backward()
@@ -445,10 +451,16 @@ for ep in range(args.num_epochs):
             sched.step()
             gstep += 1
 
-            if gstep % 100 == 0 and rank == 0:
-                print(f"[INFO] E{ep + 1} S{gstep} loss {loss.item():.4f}")
-                sys.stdout.flush()
+            # Print loss after every 10 optimizer steps for Rank 0
+            if rank == 0:
+                current_lr = sched.get_last_lr()[0]
+                if gstep % 10 == 0:
+                    print(
+                        f"[INFO] Epoch {ep + 1}/{args.num_epochs} | Global Step {gstep} | Micro Step {step // args.gradient_accumulation_steps}/{len(train_loader) // args.gradient_accumulation_steps} | Loss {loss.item():.4f} | LR {current_lr:.2e}"
+                    )
+                    sys.stdout.flush()
 
+            # Evaluation logic (can remain at its own frequency, e.g., every 500 global steps)
             if gstep % 500 == 0:
                 vl = val_loss()
                 if rank == 0:
