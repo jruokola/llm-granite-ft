@@ -4,7 +4,7 @@ This project supports fine-tuning Large Language Models for two distinct tasks:
 
 1. **CodeLlama for Chess**: Fine-tunes a CodeLlama LLM (e.g., `codellama/CodeLlama-7b-hf`) on a chess dataset (`strategic_game_chess.jsonl`) using PyTorch Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
-2. **Granite-3.3B-Instruct for Function Calling**: Fine-tunes an IBM Granite model (e.g., `ibm-granite/granite-3.3-2b-instruct`) on the `glaiveai/glaive-function-calling-v2` dataset, also using PyTorch DDP/FSDP.
+2. **Granite-3.3B-Instruct for Function Calling**: Fine-tunes an IBM Granite model (e.g., `ibm-granite/granite-3.3-2b-instruct`) using a synthetically generated dataset for function calling, orchestrated with PyTorch DDP/FSDP. For demonstration and testing purposes, external datasets like `glaiveai/glaive-function-calling-v2` or `NousResearch/hermes-function-calling-v1` are not currently used due to previous processing challenges.
 
 Both fine-tuning processes are orchestrated using Slurm for distributed training on a Nebius Kubernetes cluster.
 
@@ -41,7 +41,21 @@ llm-granite-ft/
 
 * **For Chess Fine-tuning:** The `strategic_game_chess.jsonl` file should be present in the `llm-granite-ft` directory when building the Docker image, as `Dockerfile.chess` copies it into the image.
 
-* **For Function Calling Fine-tuning:** The `fixed-scripts/function-finetune-fixed.py` script now **requires** a preprocessed dataset. You must first process your raw data (e.g., from `glaiveai/glaive-function-calling-v2`) into the format expected by the script and provide the path to this processed dataset via the `--processed_dataset_path` argument in the sbatch script. The script uses `datasets.load_from_disk` to load this.
+* **For Function Calling Fine-tuning:**
+  * The primary method for obtaining data for this task is now by using the synthetic data generator script: `llm-granite-ft/fixed-scripts/generate_granite_fc_examples.py`.
+  * This script creates a small, correctly formatted dataset with examples of function calls in the Granite format.
+  * Run this script first to generate the dataset. Example usage:
+
+```bash
+python llm-granite-ft/fixed-scripts/generate_granite_fc_examples.py \
+    --output_path ./my_synthetic_fc_dataset \
+    --num_examples 25 \
+    --tokenizer_name_or_path "ibm-granite/granite-3.3-2b-instruct" \
+    --max_seq_length 512 
+```
+
+* The `--output_path` (e.g., `./my_synthetic_fc_dataset`) will then be used as the `--processed_dataset_path` argument for the `function-finetune-fixed.py` script via the Slurm sbatch file.
+* This synthetic dataset is primarily for demonstration and testing the fine-tuning pipeline.
 
 ### 2. Build and Push Docker Images
 
@@ -127,10 +141,10 @@ This script is used to launch `fixed-scripts/function-finetune-fixed.py`. Place 
   * While the sbatch script sets `WORLD_SIZE`, `RANK`, and `LOCAL_RANK`, `torchrun` typically manages these for the application. The Python script `function-finetune-fixed.py` is designed for `env://` initialization, which `torchrun` provides.
 * **Python Script Arguments (`FINETUNE_CLI_ARGS`):**
   * `--output_dir` is set to `${CONT_JOBDIR}/checkpoints` (where `CONT_JOBDIR` is `/job_data` inside the container).
-  * `--processed_dataset_path` is set to `/processed_datasets/glaive_fc_v2/` (as per `CONT_DATADIR`). This path is inside the container and assumes your `Dockerfile.function` copies your preprocessed data to this location. **This is a critical change: the script now requires a preprocessed dataset.**
+  * `--processed_dataset_path` should be set to the path where the synthetic dataset was saved by `generate_granite_fc_examples.py` (e.g., `/path/on/shared/storage/my_synthetic_fc_dataset` if generated outside the container, or a path within the container if copied during image build or mounted). The sbatch script example might use a placeholder like `/job_data/synthetic_dataset` which you would need to ensure is correctly populated or mounted.
   * `--use_qlora` is passed by default, enabling QLoRA.
   * `--use_fp8` is also passed by default in the sbatch script, enabling FP8 for LoRA layers if `transformer_engine` is available and other conditions are met (e.g., compatible `lora_r`).
-  * The `--disable_amp` argument is **not** passed by default in the current sbatch script. This means the Python script's default AMP behavior (BF16 with GradScaler) will be active.
+  * The `--disable_amp` argument is **not** passed by default in the current sbatch script. The Python script `function-finetune-fixed.py` now handles AMP logic internally (e.g., BF16 without GradScaler by default if AMP is on and FP8 is off).
   * Other arguments for `function-finetune-fixed.py` (e.g., `--batch_size_per_device`, `--learning_rate`, other LoRA parameters) can be added to `FINETUNE_ARGS` in the sbatch script.
   * **Important Considerations for `FINETUNE_ARGS` (previously `FINETUNE_CLI_ARGS`):**
     * **`--batch_size_per_device`**: The script `function-finetune-fixed.py` defaults this to 16. For large models like Granite 3.3B, especially on GPUs with ~80GB memory, even this might be too high. It's recommended to start with a smaller value (e.g., 4 or 8) and enable `--gradient_checkpointing` to prevent Out-Of-Memory errors. Adjust based on your specific GPU memory and model size.
@@ -214,7 +228,8 @@ Ensure the paths to the sbatch scripts are correct.
 * This Dockerfile (e.g., named `Dockerfile.function` or similar, corresponding to the image `llm-granite-function-ft-fix`) should be set up to:
   * Use a suitable PyTorch base image (e.g., `nvcr.io/nvidia/pytorch:24.07-py3` or newer, as used in recent examples).
   * Install dependencies like `transformers`, `datasets`, `peft`, `bitsandbytes`, `accelerate`, and optionally `transformer_engine` (for FP8).
-  * Copy the `fixed-scripts/function-finetune-fixed.py` script and any other necessary local files (like preprocessed datasets if built into the image, though the sbatch script assumes `/processed_datasets/glaive_fc_v2` is already in the image from a `COPY` command).
+  * Copy the `fixed-scripts/function-finetune-fixed.py` script and `fixed-scripts/generate_granite_fc_examples.py` (if you intend to generate data within a job step, though typically it's a pre-step).
+  * If using the synthetic data generator as a pre-step, the `Dockerfile.function` does not necessarily need to copy the dataset itself, as the path will be provided at runtime.
 
 ## Troubleshooting
 
