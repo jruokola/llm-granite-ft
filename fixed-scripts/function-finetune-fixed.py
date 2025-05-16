@@ -160,7 +160,7 @@ def fp8_ctx():
         from transformer_engine.common.recipe import Format  # Import the Enum
 
         recipe = DelayedScaling(fp8_format=Format.HYBRID, margin=0)
-        return fp8_autocast(enabled=True, recipe=recipe)
+        return fp8_autocast(enabled=True, fp8_recipe=recipe)
     return nullcontext()
 
 
