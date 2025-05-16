@@ -78,6 +78,11 @@ cli.add_argument("--lora_dropout", type=float, default=0.05)
 cli.add_argument("--lora_target_modules", default="q_proj,v_proj")
 # Hopper FP8
 cli.add_argument("--use_fp8", action="store_true", help="Enable FP8 on H100")
+cli.add_argument(
+    "--disable_torch_compile",
+    action="store_true",
+    help="Disable torch.compile even if available",
+)
 args = cli.parse_args()
 
 # ────────────── Logging & distributed init ─────────────────
@@ -329,28 +334,68 @@ if rank == 0:
 if not args.no_fsdp:
     # torch.compile can be applied before or after FSDP.
     # If applied before, FSDP wraps the compiled module.
-    # If after, FSDP itself is compiled (less common for FSDP itself).
-    # Let's keep it before FSDP for now as in the original script.
-    if hasattr(torch, "compile") and not (
-        args.use_fp8 and TE_OK
-    ):  # TE and compile can conflict
-        model = torch.compile(model, backend="inductor", mode="max-autotune")
+    # Original script preferred compiling BEFORE FSDP.
+    # Let's revert to that order but keep the refined conditions for attempting compile.
 
+    should_attempt_compile = (
+        hasattr(torch, "compile") and not args.disable_torch_compile
+    )
+    # Problematic mode for compile: BF16 AMP (implies not args.disable_amp and not args.use_fp8)
+    is_bf16_amp_with_scaler_mode = not args.disable_amp and not args.use_fp8
+    # Risky mode for compile: FP8 is active with Transformer Engine
+    is_fp8_and_te_active = args.use_fp8 and TE_OK
+
+    if should_attempt_compile:
+        if is_bf16_amp_with_scaler_mode:
+            if rank == 0:
+                print(
+                    "[INFO] Skipping torch.compile in BF16 AMP + GradScaler mode (previously caused Dynamo errors)."
+                )
+        elif is_fp8_and_te_active:
+            if rank == 0:
+                print(
+                    "[INFO] Skipping torch.compile due to FP8 + Transformer Engine usage (potential conflict)."
+                )
+        else:
+            # Attempt compile for other cases (e.g., FP32 mode, or FP16 AMP with FP8 but TE_OK is False)
+            if rank == 0:
+                print(
+                    "[INFO] Attempting torch.compile on model BEFORE FSDP wrapping..."
+                )
+            try:
+                model = torch.compile(model, backend="inductor", mode="max-autotune")
+                if rank == 0:
+                    print("[INFO] torch.compile BEFORE FSDP successful.")
+            except Exception as e:
+                if rank == 0:
+                    print(
+                        f"[WARNING] torch.compile BEFORE FSDP failed: {e}. Proceeding without compile."
+                    )
+    elif args.disable_torch_compile and rank == 0:
+        print(
+            "[INFO] torch.compile explicitly disabled via --disable_torch_compile flag."
+        )
+    elif not hasattr(torch, "compile") and rank == 0:
+        print("[INFO] torch.compile not available in this PyTorch version.")
+
+    # Now, apply FSDP
     mixed_precision_policy = MixedPrecision(
         param_dtype=amp_dtype,
         reduce_dtype=amp_dtype,
         buffer_dtype=amp_dtype,
     )
-
     model = FSDP(
-        model,
+        model,  # model might be compiled or not at this point
         device_id=device,
         use_orig_params=True,  # Crucial for PEFT/QLoRA
         ignored_modules=fsdp_ignored_modules if args.use_qlora else None,
         sync_module_states=True,  # Ensure all ranks start with the same model states
         mixed_precision=mixed_precision_policy,
     )
-else:
+    if rank == 0:
+        print("[INFO] FSDP wrapping complete.")
+
+else:  # args.no_fsdp is True
     model = torch.nn.parallel.DistributedDataParallel(
         model.to(device), device_ids=[local_rank]
     )
