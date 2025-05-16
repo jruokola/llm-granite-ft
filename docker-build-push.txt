@@ -23,13 +23,14 @@ lftp -u jokke, \
     sftp://195.242.10.113
 ssh user@$TR_PUBLIC_IP_ADDRESS
 
-uv run python fixed-scripts/test_dataproc.py \
+uv run python llm-granite-ft/fixed-scripts/test_dataproc.py \
     --model_name_or_path "ibm-granite/granite-3.3-2b-instruct" \
-    --dataset_name "glaiveai/glaive-function-calling-v2" \
-    --dataset_data_file "glaive-function-calling-v2.json" \
-    --output_path "./glaive_fc_v2" \
-    --max_seq_length 2048 \
-    --num_samples_to_process -1 
+    --dataset_name "hqfx/glaive_fc_v2" \
+    --output_path "/path/to/your/NEW_processed_dataset_granite_format" \
+    --max_seq_length 256 \
+    --num_samples_to_process -1 \
+    --num_proc <number_of_cpus_to_use_or_omit_for_all>
+
 
 
 scp -i function-finetune-fixed.py /Users/jokkeruokolainen/Documents/Personal/Nebius/llm-granite-ft/fixed-scripts/function-finetune-fixed.py jokke@195.242.10.113:/home/jokke/llm-granite-ft/fixed-scripts/
