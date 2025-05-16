@@ -335,41 +335,48 @@ if not args.no_fsdp:
     # torch.compile can be applied before or after FSDP.
     # If applied before, FSDP wraps the compiled module.
     # Original script preferred compiling BEFORE FSDP.
-    # Let's revert to that order but keep the refined conditions for attempting compile.
+    # Compile model before FSDP, with refined conditions.
 
-    should_attempt_compile = (
-        hasattr(torch, "compile") and not args.disable_torch_compile
-    )
-    # Problematic mode for compile: BF16 AMP (implies not args.disable_amp and not args.use_fp8)
-    is_bf16_amp_with_scaler_mode = not args.disable_amp and not args.use_fp8
-    # Risky mode for compile: FP8 is active with Transformer Engine
-    is_fp8_and_te_active = args.use_fp8 and TE_OK
+    if hasattr(torch, "compile") and not args.disable_torch_compile:
+        # Check conditions under which we might skip or attempt compile.
+        # These conditions depend on amp_dtype and scaler, which are set based on args.disable_amp and args.use_fp8.
 
-    if should_attempt_compile:
-        if is_bf16_amp_with_scaler_mode:
+        # Condition for BF16 AMP with GradScaler (problematic with compile + FSDP)
+        # This occurs if AMP is ON, and FP8 is OFF.
+        is_bf16_amp_gradscaler_mode = (not args.disable_amp) and (not args.use_fp8)
+
+        # Condition for FP8 with Transformer Engine (potential conflict with compile)
+        is_fp8_and_te_active = args.use_fp8 and TE_OK
+
+        if is_bf16_amp_gradscaler_mode:
             if rank == 0:
                 print(
-                    "[INFO] Skipping torch.compile in BF16 AMP + GradScaler mode (previously caused Dynamo errors)."
+                    "[INFO] Skipping torch.compile: Currently in BF16 AMP + GradScaler mode (known to cause Dynamo errors with FSDP)."
                 )
         elif is_fp8_and_te_active:
             if rank == 0:
                 print(
-                    "[INFO] Skipping torch.compile due to FP8 + Transformer Engine usage (potential conflict)."
+                    "[INFO] Skipping torch.compile: FP8 with Transformer Engine is active (potential conflict)."
                 )
         else:
-            # Attempt compile for other cases (e.g., FP32 mode, or FP16 AMP with FP8 but TE_OK is False)
+            # Attempt compile in other cases:
+            # - FP32 mode (AMP disabled)
+            # - FP16 AMP mode (AMP on, FP8 on, implies scaler is None)
+            # - BF16 AMP if GradScaler was not instantiated (e.g. if we later decide scaler=None for BF16)
             if rank == 0:
                 print(
                     "[INFO] Attempting torch.compile on model BEFORE FSDP wrapping..."
                 )
             try:
+                model_to_compile = model  # Save pre-compile model in case of failure
                 model = torch.compile(model, backend="inductor", mode="max-autotune")
                 if rank == 0:
                     print("[INFO] torch.compile BEFORE FSDP successful.")
             except Exception as e:
+                model = model_to_compile  # Revert to pre-compile model
                 if rank == 0:
                     print(
-                        f"[WARNING] torch.compile BEFORE FSDP failed: {e}. Proceeding without compile."
+                        f"[WARNING] torch.compile BEFORE FSDP failed: {e}. Proceeding with uncompiled model."
                     )
     elif args.disable_torch_compile and rank == 0:
         print(
@@ -377,6 +384,9 @@ if not args.no_fsdp:
         )
     elif not hasattr(torch, "compile") and rank == 0:
         print("[INFO] torch.compile not available in this PyTorch version.")
+    else:  # Catch-all for no compile attempt
+        if rank == 0:
+            print("[INFO] torch.compile not attempted based on current configuration.")
 
     # Now, apply FSDP
     mixed_precision_policy = MixedPrecision(
