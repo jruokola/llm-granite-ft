@@ -28,12 +28,16 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training,
 )
+from torch.amp import GradScaler
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
 )
 from torch.distributed.fsdp import (
     MixedPrecision,
     StateDictType,
+)
+from torch.distributed.fsdp.sharded_grad_scaler import (
+    ShardedGradScaler,  # Import for FSDP+FP16
 )
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -63,8 +67,23 @@ cli.add_argument("--num_epochs", type=int, default=3)
 cli.add_argument("--max_training_steps", type=int, default=-1)
 cli.add_argument("--warmup_ratio", type=float, default=0.1)
 cli.add_argument("--gradient_checkpointing", action="store_true")
-cli.add_argument("--disable_amp", action="store_true")
-cli.add_argument("--no_fsdp", action="store_true")
+cli.add_argument(
+    "--disable_amp",
+    action="store_true",
+    help="Disable Automatic Mixed Precision (train in FP32)",
+)
+cli.add_argument(
+    "--amp_precision_mode",
+    type=str,
+    default="bf16",
+    choices=["bf16", "fp16"],
+    help="Mixed precision mode when AMP is enabled and FP8 is not used (default: bf16)",
+)
+cli.add_argument(
+    "--no_fsdp",
+    action="store_true",
+    help="Disable FSDP (use DDP instead if multiple GPUs)",
+)
 # model / data
 cli.add_argument("--model_name_or_path", default="ibm-granite/granite-3.3-2b-instruct")
 cli.add_argument("--processed_dataset_path", required=True)
@@ -76,7 +95,11 @@ cli.add_argument("--lora_alpha", type=int, default=32)
 cli.add_argument("--lora_dropout", type=float, default=0.05)
 cli.add_argument("--lora_target_modules", default="q_proj,v_proj")
 # Hopper FP8
-cli.add_argument("--use_fp8", action="store_true", help="Enable FP8 on H100")
+cli.add_argument(
+    "--use_fp8",
+    action="store_true",
+    help="Enable FP8 on H100 (implies AMP with FP16 for non-FP8 parts)",
+)
 cli.add_argument(
     "--disable_torch_compile",
     action="store_true",
@@ -84,38 +107,35 @@ cli.add_argument(
 )
 args = cli.parse_args()
 
-# ────────────── Logging & distributed init ─────────────────
-# Removed logging setup. Using print statements for output.
 
-# Check for lora_r compatibility with FP8 if QLoRA and FP8 are enabled
+# ────────────── Logging & distributed init ─────────────────
+def print_rank0_info(msg):
+    if int(os.getenv("RANK", "0")) == 0:
+        print(f"[INFO] {msg}", flush=True)
+
+
+def print_rank0_error(msg):
+    if int(os.getenv("RANK", "0")) == 0:
+        print(f"[ERROR] {msg}", file=sys.stderr, flush=True)
+
+
 if args.use_fp8 and TE_OK and args.use_qlora and (args.lora_r % 16 != 0):
     error_msg = (
         f"FP8 execution with QLoRA requires --lora_r to be a multiple of 16. "
         f"Current --lora_r is {args.lora_r}. Please adjust --lora_r (e.g., to 16, 32, etc.)."
     )
-    # Rank 0 is typically responsible for user-facing messages.
-    if int(os.getenv("RANK", "0")) == 0:  # Default to "0" if RANK is not set
-        print(f"[ERROR] {error_msg}", file=sys.stderr)
-        print(
-            f"CRITICAL ERROR: {error_msg}", file=sys.stderr
-        )  # Keep critical error for visibility
-    # Exit all processes. This check is before dist.init_process_group(), so direct exit is fine.
+    print_rank0_error(f"CRITICAL ERROR: {error_msg}")
     sys.exit(1)
 
 dist.init_process_group("nccl")
-rank, local_rank = (
-    int(os.getenv("RANK", "0")),
-    int(os.getenv("LOCAL_RANK", "0")),
-)  # Default to "0"
+rank, local_rank = int(os.getenv("RANK", "0")), int(os.getenv("LOCAL_RANK", "0"))
 torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
-if rank == 0:
-    print(f"[INFO] [rank {rank}] ready on {torch.cuda.get_device_name(device)}")
-    sys.stdout.flush()
+print_rank0_info(f"[rank {rank}] ready on {torch.cuda.get_device_name(device)}")
 
 
 # ───────────── Dataset wrapper (already tokenised) ─────────
-class Split(Dataset):
+class Split(Dataset):  # (Content unchanged)
     def __init__(self, hf_split):
         self.ds = hf_split
         self.ds.set_format("torch", ["input_ids", "attention_mask", "labels"])
@@ -136,34 +156,40 @@ tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
-# Configure amp_dtype and GradScaler based on args
-scaler = (
-    None  # Initialize scaler to None, GradScaler will be disabled for all AMP paths now
-)
+# Configure amp_dtype and GradScaler
+scaler = None
 if args.disable_amp:
     amp_dtype = torch.float32
-    # scaler is already None
-    if rank == 0:
-        print("[INFO] AMP disabled. Training in FP32.")
-        sys.stdout.flush()
-else:  # AMP is enabled
-    if not args.use_fp8:
-        # FP8 is NOT used: prefer bfloat16. GradScaler is disabled.
+    print_rank0_info("AMP disabled. Training in FP32. GradScaler is disabled.")
+elif args.use_fp8 and TE_OK:
+    amp_dtype = torch.float16
+    print_rank0_info(
+        f"FP8 enabled (TE_OK=True). Using {amp_dtype} for non-FP8 parts. GradScaler is disabled."
+    )
+else:  # AMP enabled, FP8 not used
+    if args.amp_precision_mode == "bf16":
         amp_dtype = torch.bfloat16
-        if rank == 0:
-            print(
-                f"[INFO] AMP enabled with {amp_dtype} (FP8 disabled). GradScaler is disabled."
-            )
-            sys.stdout.flush()
-    else:
-        # FP8 IS used: stick to float16. GradScaler is disabled.
+        print_rank0_info(
+            f"AMP enabled with BF16 ({amp_dtype}). GradScaler is disabled."
+        )
+        # scaler remains None
+    elif args.amp_precision_mode == "fp16":
         amp_dtype = torch.float16
-        if rank == 0:
-            print(
-                f"[INFO] AMP enabled with {amp_dtype} (FP8 enabled). GradScaler is disabled."
+        if not args.no_fsdp:  # FSDP is active
+            scaler = ShardedGradScaler()
+            print_rank0_info(
+                f"AMP enabled with FP16 ({amp_dtype}) and FSDP. ShardedGradScaler is ENABLED."
             )
-            sys.stdout.flush()
-
+        else:  # DDP or single GPU with FP16
+            scaler = GradScaler()
+            print_rank0_info(
+                f"AMP enabled with FP16 ({amp_dtype}) and DDP/SingleGPU. Standard GradScaler is ENABLED."
+            )
+    else:  # Should not happen due to choices in argparse
+        amp_dtype = torch.bfloat16
+        print_rank0_error(
+            f"Invalid amp_precision_mode: {args.amp_precision_mode}. Defaulting to BF16. GradScaler disabled."
+        )
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=args.use_qlora,
@@ -172,54 +198,36 @@ bnb_cfg = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
     bnb_4bit_quant_storage=torch.float16,
 )
-
 model = AutoModelForCausalLM.from_pretrained(
     args.model_name_or_path,
     cache_dir=".cache",
     quantization_config=bnb_cfg if args.use_qlora else None,
-    torch_dtype=amp_dtype,  # Ensures non-quantized parts match amp_dtype consistently
+    torch_dtype=amp_dtype,
     trust_remote_code=True,
 )
-
+# ... (rest of model setup, LoRA, FP8 adapter swap, FSDP wrapping etc. remains the same as the last provided full file) ...
 if args.gradient_checkpointing:
-    model.config.use_cache = False  # Essential for gradient checkpointing
+    model.config.use_cache = False
 else:
-    model.config.use_cache = True  # Or default, depending on model's original config
-
-if rank == 0:
-    print(f"[INFO] Dtype histogram: {Counter(p.dtype for p in model.parameters())}")
-    sys.stdout.flush()
-
-# attach LoRA
+    model.config.use_cache = True
+print_rank0_info(
+    f"Dtype histogram after model load: {Counter(p.dtype for p in model.parameters())}"
+)
 if args.use_qlora:
-    # prepare_model_for_kbit_training handles model.gradient_checkpointing_enable()
-    # if its use_gradient_checkpointing argument is True.
-    # However, to pass use_reentrant=False, we might need to call it separately or PEFT needs an update.
-    # For now, let PEFT handle the basic enabling. We'll explicitly set use_cache=False on the config.
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=args.gradient_checkpointing
     )
-    # If gradient checkpointing is enabled, ensure use_reentrant=False is preferred.
-    # This needs to be done on the base model if PEFT wraps it.
-    # The model object here is already the PeftModel.
     if args.gradient_checkpointing:
-        # Access the underlying Hugging Face model (e.g., GraniteForCausalLM)
-        # This model should have the gradient_checkpointing_enable method.
-        if hasattr(model, "base_model"):  # model is a PeftModel
-            actual_model_to_checkpoint = model.base_model
-        else:  # model is the original HF model (should not happen if use_qlora=True)
-            actual_model_to_checkpoint = model
-
-        actual_model_to_checkpoint.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        if rank == 0:
-            print(
-                "[INFO] Gradient checkpointing enabled with use_reentrant=False on the base model."
+        base_model_for_gc = model.base_model if hasattr(model, "base_model") else model
+        if hasattr(base_model_for_gc, "gradient_checkpointing_enable"):
+            base_model_for_gc.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-        if rank == 0:
-            sys.stdout.flush()
-
+            print_rank0_info("Gradient checkpointing enabled with use_reentrant=False.")
+        else:
+            print_rank0_info(
+                "Attempted to enable gradient checkpointing, but base model lacks `gradient_checkpointing_enable`."
+            )
     lconf = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
@@ -229,214 +237,139 @@ if args.use_qlora:
         bias="none",
     )
     model = get_peft_model(model, lconf)
-    model.print_trainable_parameters()
+    if rank == 0:
+        model.print_trainable_parameters()
 
 
-# replace LoRA linear layers with FP8 (optional)
 def fp8_ctx():
     if args.use_fp8 and TE_OK:
-        from transformer_engine.common.recipe import Format  # Import the Enum
+        from transformer_engine.common.recipe import Format
 
         recipe = DelayedScaling(fp8_format=Format.HYBRID, margin=0)
         return fp8_autocast(enabled=True, fp8_recipe=recipe)
     return nullcontext()
 
 
-# Replace LoRA adapters with FP8 Transformer-Engine layers, avoiding eval()
 if args.use_fp8 and TE_OK:
     for name, mod in model.named_modules():
         if "lora_" in name and isinstance(mod, torch.nn.Linear):
-            # create a new FP8-enabled layer
             repl = te.Linear(
-                mod.in_features,
-                mod.out_features,
-                bias=(mod.bias is not None),
+                mod.in_features, mod.out_features, bias=(mod.bias is not None)
             )
-            # copy over the trained weights
             repl.weight.data.copy_(mod.weight.data)
-
-            # split the full module path into parts
-            # e.g. "base_model.model.layers.0.self_attn.q_proj"
             parts = name.split(".")
             child_name = parts[-1]
-            parent_parts = parts[:-1]
-
-            # walk down from `model` to the parent module
             parent_mod = model
-            for p in parent_parts:
-                if p.isdigit():
-                    # numeric index into a ModuleList or list
-                    parent_mod = parent_mod[int(p)]
-                else:
-                    parent_mod = getattr(parent_mod, p)
-
-            # set the new FP8 layer in place of the old Linear
+            for p in parts[:-1]:
+                parent_mod = (
+                    parent_mod[int(p)] if p.isdigit() else getattr(parent_mod, p)
+                )
             setattr(parent_mod, child_name, repl)
+    print_rank0_info("LoRA adapters swapped to FP8 TE layers.")
 
-    if rank == 0:
-        print("[INFO] LoRA adapters swapped to FP8 TE layers.")
-    if rank == 0:
-        sys.stdout.flush()
-
-# Cast parameters of non-BitsAndBytes modules to amp_dtype before FSDP
-# This ensures uniformity for parameters FSDP will handle.
-# PEFT might upcast LayerNorms/lm_head to float32; this brings them to amp_dtype.
 fsdp_ignored_modules = []
-if args.use_qlora:  # Only ignore BnB modules if QLoRA is active
+if args.use_qlora:
     for module_name, module in model.named_modules():
         if "bitsandbytes.nn.modules" in str(type(module)).lower():
-            # Check if module is already added to avoid duplicates if nested
-            is_already_added = False
-            for added_module in fsdp_ignored_modules:
-                if module is added_module:
-                    is_already_added = True
-                    break
-            if not is_already_added:
+            if not any(module is added_module for added_module in fsdp_ignored_modules):
                 fsdp_ignored_modules.append(module)
-
 for module_name, module in model.named_modules():
-    is_ignored_for_casting = False
-    for ignored_type_module in fsdp_ignored_modules:
-        if module is ignored_type_module:  # Check actual module instance
-            is_ignored_for_casting = True
-            break
-
-    if is_ignored_for_casting:
-        continue  # Skip casting parameters of ignored (BnB) modules
-
+    if any(module is ignored_module for ignored_module in fsdp_ignored_modules):
+        continue
     for param_name, param in module.named_parameters(recurse=False):
         if param.dtype != amp_dtype:
-            # Avoid casting LoRA FP8 layers if they are handled by Transformer Engine
-            is_te_fp8_lora = False
-            if args.use_fp8 and TE_OK and "lora_" in param_name:
-                # Check if the module is a TE Linear layer
-                if hasattr(te, "pytorch") and isinstance(module, te.pytorch.Linear):
-                    is_te_fp8_lora = True
-
+            is_te_fp8_lora = (
+                args.use_fp8
+                and TE_OK
+                and "lora_" in param_name
+                and hasattr(te, "pytorch")
+                and isinstance(module, te.pytorch.Linear)
+            )
             if not is_te_fp8_lora:
-                if rank == 0:
-                    # This logging can be very verbose, enable if needed for deep debugging
-                    # log.info(f"Casting {module_name}.{param_name} from {param.dtype} to {amp_dtype}")
-                    pass
                 param.data = param.data.to(amp_dtype)
+print_rank0_info(
+    f"Dtype histogram before FSDP: {Counter(p.dtype for p in model.parameters())}"
+)
 
-if rank == 0:
-    print(
-        f"[INFO] Dtype histogram before FSDP: {Counter(p.dtype for p in model.parameters())}"
-    )
-    # To see which modules are being ignored by FSDP:
-    # print(f"[INFO] FSDP ignored_modules types: {[type(m) for m in fsdp_ignored_modules]}")
-    sys.stdout.flush()
-
-
-# ──────── FSDP (single shard → ignore int8 safely) ─────────
 if not args.no_fsdp:
-    # torch.compile can be applied before or after FSDP.
-    # If applied before, FSDP wraps the compiled module.
-    # Original script preferred compiling BEFORE FSDP.
-    # Compile model before FSDP, with refined conditions.
-
-    if hasattr(torch, "compile") and not args.disable_torch_compile:
-        # Check conditions under which we might skip or attempt compile.
-        # These conditions depend on amp_dtype and scaler, which are set based on args.disable_amp and args.use_fp8.
-
-        # Condition for BF16 AMP with GradScaler (problematic with compile + FSDP)
-        # This occurs if AMP is ON, and FP8 is OFF.
-        is_bf16_amp_gradscaler_mode = (not args.disable_amp) and (not args.use_fp8)
-
-        # Condition for FP8 with Transformer Engine (potential conflict with compile)
-        is_fp8_and_te_active = args.use_fp8 and TE_OK
-
-        if is_bf16_amp_gradscaler_mode:
-            if rank == 0:
-                print(
-                    "[INFO] Skipping torch.compile: Currently in BF16 AMP + GradScaler mode (known to cause Dynamo errors with FSDP)."
-                )
-        elif is_fp8_and_te_active:
-            if rank == 0:
-                print(
-                    "[INFO] Skipping torch.compile: FP8 with Transformer Engine is active (potential conflict)."
-                )
+    compile_model = hasattr(torch, "compile") and not args.disable_torch_compile
+    skip_compile_for_amp_fp8 = (
+        not args.disable_amp and args.amp_precision_mode == "bf16"
+    ) or (args.use_fp8 and TE_OK)  # Adjusted for bf16
+    if compile_model:
+        if skip_compile_for_amp_fp8:
+            print_rank0_info(
+                "Skipping torch.compile due to BF16 AMP or FP8+TE configuration (potential FSDP conflicts)."
+            )
         else:
-            # Attempt compile in other cases:
-            # - FP32 mode (AMP disabled)
-            # - FP16 AMP mode (AMP on, FP8 on, implies scaler is None)
-            # - BF16 AMP if GradScaler was not instantiated (e.g. if we later decide scaler=None for BF16)
-            if rank == 0:
-                print(
-                    "[INFO] Attempting torch.compile on model BEFORE FSDP wrapping..."
-                )
+            print_rank0_info(
+                "Attempting torch.compile on model BEFORE FSDP wrapping..."
+            )
             try:
-                model_to_compile = model  # Save pre-compile model in case of failure
+                model_to_compile = model
                 model = torch.compile(model, backend="inductor", mode="max-autotune")
-                if rank == 0:
-                    print("[INFO] torch.compile BEFORE FSDP successful.")
+                print_rank0_info("torch.compile BEFORE FSDP successful.")
             except Exception as e:
-                model = model_to_compile  # Revert to pre-compile model
-                if rank == 0:
-                    print(
-                        f"[WARNING] torch.compile BEFORE FSDP failed: {e}. Proceeding with uncompiled model."
-                    )
-    elif args.disable_torch_compile and rank == 0:
-        print(
-            "[INFO] torch.compile explicitly disabled via --disable_torch_compile flag."
-        )
-    elif not hasattr(torch, "compile") and rank == 0:
-        print("[INFO] torch.compile not available in this PyTorch version.")
-    else:  # Catch-all for no compile attempt
-        if rank == 0:
-            print("[INFO] torch.compile not attempted based on current configuration.")
-
-    # Now, apply FSDP
+                model = model_to_compile
+                print_rank0_error(
+                    f"torch.compile BEFORE FSDP failed: {e}. Proceeding with uncompiled model."
+                )
     mixed_precision_policy = MixedPrecision(
-        param_dtype=amp_dtype,
-        reduce_dtype=amp_dtype,
-        buffer_dtype=amp_dtype,
+        param_dtype=amp_dtype, reduce_dtype=amp_dtype, buffer_dtype=amp_dtype
     )
     model = FSDP(
-        model,  # model might be compiled or not at this point
+        model,
         device_id=device,
-        use_orig_params=True,  # Crucial for PEFT/QLoRA
+        use_orig_params=True,
         ignored_modules=fsdp_ignored_modules if args.use_qlora else None,
-        sync_module_states=True,  # Ensure all ranks start with the same model states
+        sync_module_states=True,
         mixed_precision=mixed_precision_policy,
     )
-    if rank == 0:
-        print("[INFO] FSDP wrapping complete.")
-
-else:  # args.no_fsdp is True
+    print_rank0_info("FSDP wrapping complete.")
+else:
     model = torch.nn.parallel.DistributedDataParallel(
         model.to(device), device_ids=[local_rank]
     )
+    print_rank0_info("Using DDP instead of FSDP.")
 
-# ─────────────────────── Dataloaders ───────────────────────
 ds = load_from_disk(args.processed_dataset_path)
-cut = int(0.9 * len(ds))
-train_ds, val_ds = Split(ds.select(range(cut))), Split(ds.select(range(cut, len(ds))))
-
+cut_idx = int(0.9 * len(ds))
+train_indices = list(range(cut_idx))
+val_indices = list(range(cut_idx, len(ds)))
+if dist.get_world_size() > len(train_indices):
+    print_rank0_error(
+        f"Training dataset size ({len(train_indices)}) is smaller than world size ({dist.get_world_size()}). This can lead to issues."
+    )
+if dist.get_world_size() > len(val_indices) and len(val_indices) > 0:
+    print_rank0_error(
+        f"Validation dataset size ({len(val_indices)}) is smaller than world size ({dist.get_world_size()})."
+    )
+train_ds, val_ds = Split(ds.select(train_indices)), Split(ds.select(val_indices))
 train_loader = DataLoader(
     train_ds,
     batch_size=args.batch_size_per_device,
-    sampler=DistributedSampler(train_ds, shuffle=True, seed=42),
+    sampler=DistributedSampler(train_ds, shuffle=True, seed=42, drop_last=False),
     num_workers=8,
     persistent_workers=True,
     prefetch_factor=4,
     pin_memory=True,
-    collate_fn=train_ds.collate,
+    collate_fn=Split.collate,
 )
 val_loader = DataLoader(
     val_ds,
     batch_size=args.batch_size_per_device,
-    sampler=DistributedSampler(val_ds, shuffle=False, seed=42),
+    sampler=DistributedSampler(val_ds, shuffle=False, seed=42, drop_last=False),
     num_workers=4,
     persistent_workers=True,
     pin_memory=True,
-    collate_fn=val_ds.collate,
+    collate_fn=Split.collate,
 )
-
-# ───────────── Optimiser & LR schedule ─────────────────────
 opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-steps_ep = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+steps_ep = (
+    math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    if len(train_loader) > 0
+    else 1
+)
 max_steps = (
     args.num_epochs * steps_ep
     if args.max_training_steps < 0
@@ -451,102 +384,136 @@ sched = torch.optim.lr_scheduler.LambdaLR(
 )
 
 
-# eval helper
 @torch.no_grad()
-def val_loss():
+def val_loss():  # (Content mostly unchanged, uses amp_dtype and fp8_ctx)
     model.eval()
-    tot = torch.zeros([], device=device)
+    tot_loss = torch.zeros([], device=device)
+    num_batches = 0
+    if len(val_loader) == 0:
+        pass
     for b in val_loader:
         b = {k: v.to(device) for k, v in b.items()}
-        with torch.autocast("cuda", amp_dtype) if scaler else nullcontext():
-            tot += model(**b).loss.float()
-    dist.all_reduce(tot)
-    return (tot / (len(val_loader) * dist.get_world_size())).item()
+        with (
+            torch.autocast("cuda", amp_dtype)
+            if not args.disable_amp
+            else nullcontext(),
+            fp8_ctx(),
+        ):
+            tot_loss += model(**b).loss.float()
+        num_batches += 1
+    loss_sum_tensor = tot_loss.clone().detach()
+    num_batches_tensor = torch.tensor(num_batches, device=device, dtype=torch.int64)
+    dist.all_reduce(loss_sum_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(num_batches_tensor, op=dist.ReduceOp.SUM)
+    if num_batches_tensor.item() == 0:
+        return 0.0
+    return (loss_sum_tensor / num_batches_tensor).item()
 
 
-def save(tag):
-    if rank:
+def save(tag):  # (Content mostly unchanged)
+    if rank != 0:
         return
     path = os.path.join(args.output_dir, tag)
     os.makedirs(path, exist_ok=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        model.module.save_pretrained(path)
-    if rank == 0:
-        print(f"[INFO] ✓ checkpoint {tag}")
-    if rank == 0:
-        sys.stdout.flush()
+    if not args.no_fsdp:
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+            cpu_state_dict = model.state_dict()
+        if hasattr(model, "module") and hasattr(model.module, "save_pretrained"):
+            model.module.save_pretrained(path, state_dict=cpu_state_dict)
+        else:
+            torch.save(cpu_state_dict, os.path.join(path, "pytorch_model.bin"))
+            print_rank0_info(
+                f"Saved FSDP full state_dict to {os.path.join(path, 'pytorch_model.bin')}"
+            )
+        tok.save_pretrained(path)
+    else:
+        if hasattr(model, "module"):
+            model.module.save_pretrained(path)
+        else:
+            model.save_pretrained(path)
+        tok.save_pretrained(path)
+    print_rank0_info(f"✓ Checkpoint '{tag}' saved to {path}")
 
 
-# ───────────────────── Main train loop ─────────────────────
 if rank == 0:
     os.makedirs(args.output_dir, exist_ok=True)
-    print(
-        f"[INFO] nvidia-smi output:\n{subprocess.check_output(['nvidia-smi']).decode().strip()}"
-    )
-    sys.stdout.flush()
+    try:
+        smi_output = subprocess.check_output(["nvidia-smi"]).decode().strip()
+        print_rank0_info(f"nvidia-smi output:\n{smi_output}")
+    except Exception as e:
+        print_rank0_error(f"Could not run nvidia-smi: {e}")
 
 model.train()
 gstep = 0
-best = 1e9
+best_val_loss = float("inf")
 for ep in range(args.num_epochs):
-    train_loader.sampler.set_epoch(ep)
+    if hasattr(train_loader.sampler, "set_epoch"):
+        train_loader.sampler.set_epoch(ep)
     for step, batch in enumerate(train_loader, 1):
         batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.autocast("cuda", amp_dtype) if scaler else nullcontext(), fp8_ctx():
-            loss = model(**batch).loss / args.gradient_accumulation_steps
-            if rank == 0:  # Or check on all ranks if preferred
-                if torch.isinf(loss).any() or torch.isnan(loss).any():
-                    print(
-                        f"[ERROR] Rank {rank} - Loss became inf/nan BEFORE backward: {loss.item()}",
-                        file=sys.stderr,
-                    )
-
+        with (
+            torch.autocast("cuda", amp_dtype)
+            if not args.disable_amp
+            else nullcontext(),
+            fp8_ctx(),
+        ):
+            loss = model(**batch).loss
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+        if torch.isinf(loss).any() or torch.isnan(loss).any():
+            print_rank0_error(
+                f"Rank {rank} - Loss became inf/nan BEFORE backward: {loss.item()}. Skipping step."
+            )
+            opt.zero_grad()
+            continue
         if scaler:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-
         if step % args.gradient_accumulation_steps == 0:
             if scaler:
                 scaler.unscale_(opt)
+            if not args.no_fsdp:
+                model.clip_grad_norm_(1.0)
+            else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if scaler:
                 scaler.step(opt)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
-
             opt.zero_grad()
             sched.step()
             gstep += 1
-
-            # Print loss after every 10 optimizer steps for Rank 0
             if rank == 0:
                 current_lr = sched.get_last_lr()[0]
                 if gstep % 10 == 0:
-                    print(
-                        f"[INFO] Epoch {ep + 1}/{args.num_epochs} | Global Step {gstep} | Micro Step {step // args.gradient_accumulation_steps}/{len(train_loader) // args.gradient_accumulation_steps} | Loss {loss.item():.4f} | LR {current_lr:.2e}"
+                    print_rank0_info(
+                        f"Epoch {ep + 1}/{args.num_epochs} | Step {gstep}/{max_steps} | Batch {step // args.gradient_accumulation_steps}/{len(train_loader) // args.gradient_accumulation_steps if args.gradient_accumulation_steps > 0 else len(train_loader)} | Loss {loss.item() * args.gradient_accumulation_steps:.4f} | LR {current_lr:.2e}"
                     )
-                    sys.stdout.flush()
-
-            # Evaluation logic (can remain at its own frequency, e.g., every 500 global steps)
-            if gstep % 500 == 0:
-                vl = val_loss()
+            if gstep > 0 and gstep % 200 == 0:
+                current_val_loss = val_loss()
+                model.train()
                 if rank == 0:
-                    mb = torch.cuda.max_memory_allocated() / 1e9
-                    print(
-                        f"[INFO] eval {vl:.4f} (best {best:.4f}) - {mb:.1f} GB max_alloc"
+                    max_mem_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+                    print_rank0_info(
+                        f"Validation Loss after GStep {gstep}: {current_val_loss:.4f} (Best: {best_val_loss:.4f}) | Max GPU Mem: {max_mem_gb:.2f} GB"
                     )
-                    sys.stdout.flush()
-                    if vl < best:
-                        best = vl
-                        save("best")  # save already prints and flushes
-
-            if 0 < args.max_training_steps == gstep:
+                    if current_val_loss < best_val_loss:
+                        best_val_loss = current_val_loss
+                        print_rank0_info(
+                            f"New best validation loss: {best_val_loss:.4f}. Saving checkpoint 'best'."
+                        )
+                        save("best")
+            if 0 < args.max_training_steps <= gstep:
                 break
-    if 0 < args.max_training_steps == gstep:
+    if 0 < args.max_training_steps <= gstep:
+        print_rank0_info(
+            f"Reached max_training_steps ({args.max_training_steps}). Stopping training."
+        )
         break
-
 if rank == 0:
+    print_rank0_info("Training finished. Saving final model.")
     save("final")
 dist.destroy_process_group()
+print_rank0_info("Distributed process group destroyed. Exiting.")
