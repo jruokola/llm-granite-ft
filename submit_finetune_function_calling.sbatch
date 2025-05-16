@@ -1,4 +1,5 @@
-!/bin/bash
+  GNU nano 6.2                                       submit_finetune_function_calling.sbatch *                                              
+#!/bin/bash
 #SBATCH --job-name=fc-qlora-h100
 #SBATCH --nodes=2                # one H100 per node
 #SBATCH --ntasks-per-node=1
@@ -10,7 +11,7 @@
 #SBATCH --export=ALL             # propagate env to Pyxis
 
 ############################ 0. constants & job paths #########################
-IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-13:latest"
+IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-23:latest"
 JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord"
 HOST_JOBDIR="/mnt/jail/${JOB_DIR}"
@@ -30,41 +31,42 @@ echo "IMAGE  ${IMAGE}"
 echo "CONTAINER_MOUNTS ${CONTAINER_MOUNTS}"
 
 ############################ 2. environment ###################################
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WORLD_SIZE=${SLURM_NNODES}
-export RANK=${SLURM_PROCIF}
-export LOCAL_RANK=${SLURM_NTASKS}
-export NCCL_DEBUG=INFO
+export RANK=${SLURM_PROCID}
+export LOCAL_RANK=${SLURM_LOCALID}
+export WORLD_SIZE=${SLURM_NTASKS}
+export NCCL_DEBUG=WARN
 export PYXIS_VERBOSE=3
 export TORCH_DISTRIBUTED_TIMEOUT=1800
-export HF_DATASETS_CACHE="${CONT_JOB_DIR}/hf_cache"
-export TOKENIZERS_PARALLELISM=False
+export HF_DATASETS_CACHE=${CONT_JOB_DIR}/hf_cache
+export TOKENIZERS_PARALLELISM=false
 export FLASH_ATTENTION_FORCE_CUDA=1
 
 ############################ 3. python CLI ####################################
 FINETUNE_ARGS="--output_dir=${CONT_JOBDIR}/checkpoints \
-    --processed_dataset_path=${CONT_DATADIR} \
-    --use_qlora \
-    --use_fp8"
+  --processed_dataset_path=${CONT_DATADIR} \
+  --use_qlora \
+  --use_fp8 \
+  --gradient_checkpointing"
 
-TORCHRUN_CMD="torchrun \
+TORCHRUN_CMD="\
+torchrun \
     --nnodes=${SLURM_NNODES} \
-    --max_restarts=3 \
-    --nproc_per_node=${SLURM_GPUS_ON_NODE} \
-    --rdzv_backend=c10d \
-    --rdzv_id=${SLURM_JOB_ID} \
-    --rdzv_backend=${MASTER_IP}:${MASTER_PORT} \
+    --max-restarts=1 \
+    --nproc-per-node=1 \
+    --rdzv-id=${SLURM_JOB_ID} \
+    --rdzv-backend="c10d" \
+    --rdzv-endpoint="worker-0.soperator-worker-svc.soperator.svc.cluster.local:${MASTER_PORT}" \
     function-finetune-fixed.py ${FINETUNE_ARGS}"
 
+############################ 4. launch containers #############################
 ## ─── Launch with srun + env:// init ──────────────────────────────────────────
 srun \
-     --export=ALL,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT \
-     --export=HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,PYTORCH_CUDA_ALLOC_CONF \
-     --export=WORLD_SIZE,RANK,LOCAL_RANK \
-     --container-image="${IMAGE}" \
-     --container-mounts="${CONTAINER_MOUNTS}" \
+     --export=ALL,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FO>
+     --container-image=${IMAGE} \
+     --container-mounts=${CONTAINER_MOUNTS} \
      --container-workdir="/workspace" \
-    bash -c "${TORCHRUN_CMD}"
+     bash -c "${TORCHRUN_CMD}"
 
 EXIT_CODE=$?
 echo "Job finished with exit code ${EXIT_CODE}"
