@@ -29,7 +29,6 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training,
 )
-from torch.amp import GradScaler
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
 )
@@ -130,8 +129,19 @@ tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
-amp_dtype = torch.float16 if not args.disable_amp else torch.float32
-scaler = GradScaler() if not args.disable_amp else None
+if args.disable_amp:
+    amp_dtype = torch.float32
+    scaler = None
+    log.info("AMP disabled. Training in FP32.")
+else:
+    # User changed from bfloat16 to float16 due to previous GradScaler issues.
+    # When FSDP's param_dtype is torch.float16 (derived from amp_dtype here),
+    # GradScaler is generally not used/needed as FSDP handles FP16 parameters.
+    amp_dtype = torch.float16
+    scaler = None  # Disable GradScaler
+    log.info(
+        f"AMP enabled with {amp_dtype}. GradScaler is disabled; FSDP with FP16 params assumed."
+    )
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=args.use_qlora,
