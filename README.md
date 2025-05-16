@@ -115,20 +115,27 @@ This script is used to launch `fixed-scripts/function-finetune-fixed.py`. Place 
 
 **Key configurations in `submit_finetune_function_calling.sbatch`:**
 
-* **Job Name:** Set to `function-finetune`.
-* **Output Log:** Main Slurm log is directed to `/root/slurm_logs/function_finetune_%j.log`. Node-specific logs are created within the job's shared directory.
-* **Container Image:** The sbatch script uses `CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-transformers:latest"`. Ensure this matches the image you built and pushed.
-* **Shared Job Directory:** Base directory for outputs, logs, and coordination files is `/root/slurm_jobs/function_finetune/${SLURM_JOB_ID}`. This is mounted into the container at `/job_data`.
-* **Python Script:** Executes `/workspace/function-finetune-fixed.py`.
-* **NCCL Environment Variables:** The sbatch script now sets `NCCL_COLLNET_ENABLE=0`, `NCCL_IB_HCA`, and `NCCL_NET_GDR_LEVEL`.
-* **Distributed Setup (Manual):**
-  * The script manually sets up `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` environment variables for the Python script. This setup does **not** use `torchrun`.
+* **Job Name:** Set to `fc-qlora-h100` (as per `#SBATCH --job-name`).
+* **Output Log:** Main Slurm log is directed to `/root/slurm_logs/fc_%j.log` (as per `#SBATCH --output`). Node-specific logs may be created by the application within the job's shared directory.
+* **Container Image:** The sbatch script uses `IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-13:latest"`. Ensure this matches the image you built and pushed.
+* **Shared Job Directory:** Base directory for outputs, logs, and coordination files is `/slurm_jobs/${SLURM_JOB_ID}` on the host, mounted into the container at `/job_data`. (Note: The sbatch script uses `/mnt/jail/` prefix for `HOST_JOBDIR` internally, but the conceptual host path for user understanding is `/slurm_jobs/...`).
+* **Python Script:** Executes `function-finetune-fixed.py` (located in the container's `/workspace`).
+* **NCCL Environment Variables:** The sbatch script sets `NCCL_DEBUG=INFO`. Other NCCL variables like `NCCL_COLLNET_ENABLE`, `NCCL_IB_HCA` are not explicitly set in the current version of the sbatch script.
+* **Distributed Setup (using `torchrun`):**
+  * The script now uses `torchrun` to launch `function-finetune-fixed.py`.
+  * `torchrun` parameters include `--nnodes`, `--nproc_per_node`, `--rdzv_backend=c10d`, `--rdzv_id`, and `--rdzv_endpoint` (constructed from `MASTER_IP` and `MASTER_PORT` derived from Slurm).
+  * While the sbatch script sets `WORLD_SIZE`, `RANK`, and `LOCAL_RANK`, `torchrun` typically manages these for the application. The Python script `function-finetune-fixed.py` is designed for `env://` initialization, which `torchrun` provides.
 * **Python Script Arguments (`FINETUNE_CLI_ARGS`):**
-  * `--output_dir` is set to `${CONTAINER_JOB_DIR}/checkpoints`.
-  * `--processed_dataset_path` is set to `/processed_datasets/glaive_fc_v2`. This path is inside the container and assumes your `Dockerfile.function` copies your preprocessed data to this location. **This is a critical change: the script now requires a preprocessed dataset.**
+  * `--output_dir` is set to `${CONT_JOBDIR}/checkpoints` (where `CONT_JOBDIR` is `/job_data` inside the container).
+  * `--processed_dataset_path` is set to `/processed_datasets/glaive_fc_v2/` (as per `CONT_DATADIR`). This path is inside the container and assumes your `Dockerfile.function` copies your preprocessed data to this location. **This is a critical change: the script now requires a preprocessed dataset.**
   * `--use_qlora` is passed by default, enabling QLoRA.
-  * The `--disable_amp` argument is **not** passed by default in the current sbatch script (the line is commented out). This means the Python script's default AMP behavior (BF16 with GradScaler) will be active.
-  * Other arguments for `function-finetune-fixed.py` (e.g., `--batch_size_per_device`, `--learning_rate`, LoRA parameters) can be added to `FINETUNE_CLI_ARGS`.
+  * `--use_fp8` is also passed by default in the sbatch script, enabling FP8 for LoRA layers if `transformer_engine` is available and other conditions are met (e.g., compatible `lora_r`).
+  * The `--disable_amp` argument is **not** passed by default in the current sbatch script. This means the Python script's default AMP behavior (BF16 with GradScaler) will be active.
+  * Other arguments for `function-finetune-fixed.py` (e.g., `--batch_size_per_device`, `--learning_rate`, other LoRA parameters) can be added to `FINETUNE_ARGS` in the sbatch script.
+  * **Important Considerations for `FINETUNE_ARGS` (previously `FINETUNE_CLI_ARGS`):**
+    * **`--batch_size_per_device`**: The script `function-finetune-fixed.py` defaults this to 16. For large models like Granite 3.3B, especially on GPUs with ~80GB memory, even this might be too high. It's recommended to start with a smaller value (e.g., 4 or 8) and enable `--gradient_checkpointing` to prevent Out-Of-Memory errors. Adjust based on your specific GPU memory and model size.
+    * **`--lora_r`**: If using QLoRA (`--use_qlora`) in conjunction with FP8 (`--use_fp8`), the `--lora_r` value **must be a multiple of 16**. The script `function-finetune-fixed.py` defaults `--lora_r` to 16 and includes a check to enforce this.
+    * **`--gradient_checkpointing`**: Strongly recommended to reduce memory usage, especially with large batch sizes or models. Ensure this flag is passed in `FINETUNE_CLI_ARGS` if needed.
 
 ### 4. Configure Enroot Authentication (If using private registry)
 
@@ -178,7 +185,7 @@ Ensure the paths to the sbatch scripts are correct.
 * **Current Version (as of last update):** This script is significantly refactored for fine-tuning models like `ibm-granite/granite-3.3-2b-instruct` using PyTorch FSDP with QLoRA.
 * **Key Features:**
   * **FSDP:** Uses `torch.distributed.fsdp.FullyShardedDataParallel` by default.
-    * Employs `transformer_auto_wrap_policy` for layer sharding.
+    * Utilizes `use_orig_params=True` and `ignored_modules` (especially for QLoRA compatibility) when initializing FSDP. It does not use a specific Hugging Face `transformer_auto_wrap_policy`.
     * Includes logic to set `ignored_modules` for FSDP, particularly for handling potential `int8` parameters from quantization.
     * Uses `sync_module_states=True` and `StateDictType.FULL_STATE_DICT` for robust checkpointing.
   * **QLoRA:** Enabled via the `--use_qlora` flag.
@@ -187,12 +194,12 @@ Ensure the paths to the sbatch scripts are correct.
   * **FP8 Support (Optional):** Includes experimental support for NVIDIA Transformer Engine FP8 for LoRA adapters (`--use_fp8`), if `transformer_engine` is available.
   * **Data Handling:**
     * **Requires preprocessed data:** The script loads data using `datasets.load_from_disk` via the mandatory `--processed_dataset_path` argument. On-the-fly processing of raw datasets is no longer supported in this version.
-    * Uses a custom `PreprocessedDataset` class.
+    * Uses a custom `Split` class (a wrapper around a Hugging Face `Dataset` split).
   * **Mixed Precision:** AMP is enabled by default using `torch.bfloat16` and `GradScaler`. Can be disabled with `--disable_amp` (falls back to `torch.float32` for `bnb_4bit_compute_dtype` if QLoRA is also off, otherwise `amp_dtype` becomes `float32`).
   * **Optimizer & Scheduler:** Uses `torch.optim.AdamW` and a linear warmup LR schedule.
   * **Gradient Checkpointing:** Supported via `--gradient_checkpointing`.
   * **Logging & Checkpointing:** Standard logging and checkpoint saving logic, compatible with FSDP.
-  * **Distributed Launch:** Designed to be launched directly by `python` with environment variables for distributed setup (as done by the sbatch script), not `torchrun`.
+  * **Distributed Launch:** The `submit_finetune_function_calling.sbatch` script now uses `torchrun` to launch this Python script. The Python script itself is compatible with `torchrun`'s `env://` initialization method for distributed training.
 
 ## Dockerization
 
@@ -215,7 +222,11 @@ Ensure the paths to the sbatch scripts are correct.
 * **Image Pull Errors (401 Unauthorized):** Verify Enroot authentication credentials for your registry.
 * **Pyxis Errors (`couldn't start container`):** Check image pull success, `--container-mounts` validity (host path exists and has permissions), and basic container functionality.
 * **`torchrun` Errors / DDP Init Errors (for `chess-finetune.py` or similar `torchrun`-based scripts):** Ensure `srun` is passing necessary Slurm environment variables (`SLURM_PROCID`, `SLURM_NTASKS`, etc.) correctly into the container for `torchrun` auto-detection.
-* **Direct Python Launch DDP/FSDP Init Errors (for `function-finetune-fixed.py`):** If `torch.distributed.init_process_group` fails or hangs, double-check that `MASTER_ADDR`, `MASTER_PORT`, `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` are correctly set by the `submit_finetune_function_calling.sbatch` script (e.g., by examining the node-specific logs in `/root/slurm_jobs/function_finetune/${SLURM_JOB_ID}/logs/`). Also check the new NCCL environment variables in the sbatch script.
+* **`torchrun` / DDP/FSDP Init Errors (for `function-finetune-fixed.py`):** If `torch.distributed.init_process_group` (called internally by the script for `env://` init) fails or hangs:
+  * Verify `torchrun` parameters in the sbatch script (`--nnodes`, `--nproc_per_node`, rendezvous endpoint).
+  * Check that `MASTER_IP` and `MASTER_PORT` are correctly determined and accessible between nodes.
+  * Examine `NCCL_DEBUG=INFO` output and any node-specific logs within the job directory for clues.
+  * Ensure the network configuration (e.g., InfiniBand, Ethernet) is correctly utilized by NCCL.
 * **`ModuleNotFoundError`:** Ensure the respective Dockerfile (`Dockerfile.chess` or `Dockerfile.function`) installs all required Python packages. Check `PYTHONPATH` if necessary, although direct script execution in `/workspace` (or `/workspace/fixed-scripts/`) should generally work if scripts and dependencies are correctly placed.
 * **CUDA Errors / `nvidia-smi` fails inside container:** Likely an issue with Pyxis/Enroot setup, host drivers, or Slurm GPU resource allocation (`gres.conf`, cgroups). Escalate to admin if basic checks fail.
 * **Node Failure:** As seen previously, check `slurmctld.log` via admin for hardware/daemon issues on the specific worker node.

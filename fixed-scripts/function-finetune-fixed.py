@@ -3,11 +3,10 @@
 """
 QLoRA + LoRA fine-tuning on 2 × H100 (1 GPU / node) with single-shard FSDP.
 
-• 4-bit NF4 base weights  +  LoRA adapters (r=8, α=32)
+• 4-bit NF4 base weights  +  LoRA adapters (r=16, α=32)
 • Optional FP8 forward via NVIDIA-Transformer-Engine (--use_fp8)
 • One FSDP shard per rank (use_orig_params=True) → no dtype clashes
-• Flash-Attention-2 auto-enabled on Hopper
-• No shared filesystem needed – only a common dataset cache inside the container
+• Flash-Attention-2 auto-enabled on Hopper (H100)
 """
 
 # ───────────────────────── Std lib ──────────────────────────
