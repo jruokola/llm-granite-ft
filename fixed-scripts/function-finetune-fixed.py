@@ -169,14 +169,19 @@ if args.use_qlora:
     # This needs to be done on the base model if PEFT wraps it.
     # The model object here is already the PeftModel.
     if args.gradient_checkpointing:
-        # Access the underlying model to enable gradient checkpointing if it's a PEFT model
-        actual_model_to_checkpoint = (
-            model.base_model.model if hasattr(model, "base_model") else model
-        )
+        # Access the underlying Hugging Face model (e.g., GraniteForCausalLM)
+        # This model should have the gradient_checkpointing_enable method.
+        if hasattr(model, "base_model"):  # model is a PeftModel
+            actual_model_to_checkpoint = model.base_model
+        else:  # model is the original HF model (should not happen if use_qlora=True)
+            actual_model_to_checkpoint = model
+
         actual_model_to_checkpoint.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        log.info("Gradient checkpointing enabled with use_reentrant=False.")
+        log.info(
+            "Gradient checkpointing enabled with use_reentrant=False on the base model."
+        )
 
     lconf = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
