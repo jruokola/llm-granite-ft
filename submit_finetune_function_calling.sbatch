@@ -1,81 +1,71 @@
-#!/bin/bash
-###############################################################################
-#  Function-calling fine-tune on 2 × H100 nodes (single-GPU per node)
-###############################################################################
-#SBATCH --job-name=function-finetune              # job name
-#SBATCH --nodes=2                                 # 2 nodes
-#SBATCH --ntasks-per-node=1                       # 1 task  (=1 container) per node
-#SBATCH --gres=gpu:1                              # 1 H100 per node
-#SBATCH --cpus-per-task=8                         # host threads for dataloader / NCCL
-#SBATCH --mem=180G                                # RAM per node
-#SBATCH --time=23:59:00                           # wall-clock limit
-#SBATCH --output=/root/slurm_logs/function_finetune_%j.log
-#SBATCH --export=ALL
-###############################################################################
-# 0.  Cluster / container constants
-###############################################################################
-CONTAINER_IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-5:latest"
-JOB_DIR="/root/slurm_jobs/function_finetune/${SLURM_JOB_ID}"
-CHECKPOINTS_DIR="${JOB_DIR}/checkpoints"
-LOGS_DIR="${JOB_DIR}/logs"
-mkdir -p "${CHECKPOINTS_DIR}" "${LOGS_DIR}"
+!/bin/bash
+#SBATCH --job-name=fc-qlora-h100
+#SBATCH --nodes=2                # one H100 per node
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=180G
+#SBATCH --time=23:00:00
+#SBATCH --output=/root/slurm_logs/fc_%j.log
+#SBATCH --export=ALL             # propagate env to Pyxis
+
+############################ 0. constants & job paths #########################
+IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-13:latest"
+JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
+COORD_DIR="${JOB_DIR}/coord"
+HOST_JOBDIR="/mnt/jail/${JOB_DIR}"
+CONT_JOBDIR="/job_data"
+CONT_DATADIR="/processed_datasets/glaive_fc_v2/"
+
+mkdir -p "${COORD_DIR}"
 chmod -R 777 "${JOB_DIR}"
+############################ 1. rendez-vous params ############################
+CONTAINER_MOUNTS="${JOB_DIR}:${CONT_JOBDIR}:rw"
+MASTER_NODE=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
+MASTER_IP=$(getent hosts "${MASTER_NODE}" | awk '{print $1}')
+MASTER_PORT=$(( 29500 + RANDOM % 1000 ))               # free high port
 
-# expose JOB_DIR inside the container at /job_data
-CONTAINER_MOUNTS="${JOB_DIR}:/job_data"
-CONTAINER_WORKDIR="/workspace"
+echo "HEAD NODE: ${MASTER_NODE} ${MASTER_IP}:${MASTER_PORT}"
+echo "IMAGE  ${IMAGE}"
+echo "CONTAINER_MOUNTS ${CONTAINER_MOUNTS}"
 
-###############################################################################
-# 1.  Performance-tuning env vars  (all tasks inherit via --export=ALL)
-###############################################################################
-export NCCL_DEBUG=INFO                              # helpful diagnostics  [oai_citation:1‡Dongda's homepage](https://dongdongbh.tech/blog/torchrun/?utm_source=chatgpt.com)
-export NCCL_COLLNET_ENABLE=0                        # disable CollNet on ≤ 2 GPUs  [oai_citation:2‡Dongda's homepage](https://dongdongbh.tech/blog/torchrun/?utm_source=chatgpt.com)
-export NCCL_NET_GDR_LEVEL=2                         # prefer NVLink/IB RDMA  [oai_citation:3‡Dongda's homepage](https://dongdongbh.tech/blog/torchrun/?utm_source=chatgpt.com)
-export NCCL_IB_HCA=$(ibv_devinfo -l | head -n1)     # pick the first HCA   [oai_citation:4‡swaglu.com](https://swaglu.com/llama-405b-vllm-slurm-multinode/?utm_source=chatgpt.com)
-export NCCL_SOCKET_IFNAME=^docker0,lo               # skip docker / loopback  [oai_citation:5‡GitHub](https://github.com/NVIDIA/pyxis?utm_source=chatgpt.com)
-export CUDA_DEVICE_MAX_CONNECTIONS=1                # fewer GPU peer queues improves latency  [oai_citation:6‡Markaicode](https://markaicode.com/pytorch-3-nvidia-h100-optimization-guide/?utm_source=chatgpt.com)
-export TORCH_DISTRIBUTED_TIMEOUT=600                # 10 min rendez-vous timeout  [oai_citation:7‡PyTorch Forums](https://discuss.pytorch.org/t/distributeddataparallel-socket-timeout/174192?utm_source=chatgpt.com)
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}       # use all allocated CPU cores
-export HF_DATASETS_CACHE="/job_data/hf_cache"       # keep cache on fast SSD  [oai_citation:8‡Hugging Face](https://huggingface.co/docs/datasets/cache?utm_source=chatgpt.com)
+############################ 2. environment ###################################
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export WORLD_SIZE=${SLURM_NNODES}
+export RANK=${SLURM_PROCIF}
+export LOCAL_RANK=${SLURM_NTASKS}
+export NCCL_DEBUG=INFO
+export PYXIS_VERBOSE=3
+export TORCH_DISTRIBUTED_TIMEOUT=1800
+export HF_DATASETS_CACHE="${CONT_JOB_DIR}/hf_cache"
+export TOKENIZERS_PARALLELISM=False
 export FLASH_ATTENTION_FORCE_CUDA=1
-###############################################################################
-# 2.  Build CLI for the fine-tune script (passed unchanged to torchrun)
-###############################################################################
-FINETUNE_CLI_ARGS="\
- --output_dir=/job_data/checkpoints \
- --processed_dataset_path=/processed_datasets/glaive_fc_v2 \
- --use_qlora \
- --use_fp8"
 
-echo "FINETUNE_CLI_ARGS: ${FINETUNE_CLI_ARGS}"
+############################ 3. python CLI ####################################
+FINETUNE_ARGS="--output_dir=${CONT_JOBDIR}/checkpoints \
+    --processed_dataset_path=${CONT_DATADIR} \
+    --use_qlora \
+    --use_fp8"
 
-###############################################################################
-# 3.  Decide rendez-vous endpoint (rank-0 node’s IP + random high port)
-###############################################################################
-MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
-MASTER_PORT=$(( 29500 + RANDOM % 1000 ))
-echo "MASTER_ADDR=${MASTER_ADDR}  MASTER_PORT=${MASTER_PORT}"
+TORCHRUN_CMD="torchrun \
+    --nnodes=${SLURM_NNODES} \
+    --max_restarts=3 \
+    --nproc_per_node=${SLURM_GPUS_ON_NODE} \
+    --rdzv_backend=c10d \
+    --rdzv_id=${SLURM_JOB_ID} \
+    --rdzv_backend=${MASTER_IP}:${MASTER_PORT} \
+    function-finetune-fixed.py ${FINETUNE_ARGS}"
 
-###############################################################################
-# 4.  Launch: one container per node, torchrun inside each container
-###############################################################################
-srun --container-image="${CONTAINER_IMAGE}" \
+## ─── Launch with srun + env:// init ──────────────────────────────────────────
+srun \
+     --export=ALL,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT \
+     --export=HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,PYTORCH_CUDA_ALLOC_CONF \
+     --export=WORLD_SIZE,RANK,LOCAL_RANK \
+     --container-image="${IMAGE}" \
      --container-mounts="${CONTAINER_MOUNTS}" \
-     --container-workdir="${CONTAINER_WORKDIR}" \
-     --label --verbose \
-     torchrun \
-       --nnodes=${SLURM_NNODES} \
-       --nproc_per_node=${SLURM_GPUS_ON_NODE} \
-       --rdzv_backend=c10d \
-       --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-       /workspace/function-finetune-fixed.py \
-       ${FINETUNE_CLI_ARGS}
+     --container-workdir="/workspace" \
+    bash -c "${TORCHRUN_CMD}"
 
-###############################################################################
-# 5.  Final status
-###############################################################################
 EXIT_CODE=$?
-echo "============================================================"
-echo "Job ${SLURM_JOB_ID} finished with exit code ${EXIT_CODE}"
-echo "============================================================"
+echo "Job finished with exit code ${EXIT_CODE}"
 exit ${EXIT_CODE}
