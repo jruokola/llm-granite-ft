@@ -132,7 +132,7 @@ model = AutoModelForCausalLM.from_pretrained(
     args.model_name_or_path,
     cache_dir=".cache",
     quantization_config=bnb_cfg if args.use_qlora else None,
-    torch_dtype=None if args.use_qlora else amp_dtype,
+    torch_dtype=amp_dtype,  # Ensures non-quantized parts match amp_dtype consistently
     trust_remote_code=True,
 )
 log.info(f"Dtype histogram: {Counter(p.dtype for p in model.parameters())}")
