@@ -148,13 +148,36 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=amp_dtype,  # Ensures non-quantized parts match amp_dtype consistently
     trust_remote_code=True,
 )
+
+if args.gradient_checkpointing:
+    model.config.use_cache = False  # Essential for gradient checkpointing
+else:
+    model.config.use_cache = True  # Or default, depending on model's original config
+
 log.info(f"Dtype histogram: {Counter(p.dtype for p in model.parameters())}")
 
 # attach LoRA
 if args.use_qlora:
+    # prepare_model_for_kbit_training handles model.gradient_checkpointing_enable()
+    # if its use_gradient_checkpointing argument is True.
+    # However, to pass use_reentrant=False, we might need to call it separately or PEFT needs an update.
+    # For now, let PEFT handle the basic enabling. We'll explicitly set use_cache=False on the config.
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=args.gradient_checkpointing
     )
+    # If gradient checkpointing is enabled, ensure use_reentrant=False is preferred.
+    # This needs to be done on the base model if PEFT wraps it.
+    # The model object here is already the PeftModel.
+    if args.gradient_checkpointing:
+        # Access the underlying model to enable gradient checkpointing if it's a PEFT model
+        actual_model_to_checkpoint = (
+            model.base_model.model if hasattr(model, "base_model") else model
+        )
+        actual_model_to_checkpoint.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        log.info("Gradient checkpointing enabled with use_reentrant=False.")
+
     lconf = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
