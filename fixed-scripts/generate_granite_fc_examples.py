@@ -18,7 +18,7 @@ ROLE_AVAILABLE_TOOLS_GRANITE = "available_tools"
 
 
 # Helper print functions (defined early)
-def print_rank0(*args, **kwargs):
+def print(*args, **kwargs):
     # Simple print for non-distributed script, or for rank 0 if run in such context
     if int(os.getenv("RANK", "0")) == 0:
         print(*args, **kwargs)
@@ -26,7 +26,7 @@ def print_rank0(*args, **kwargs):
             sys.stdout.flush()
 
 
-def eprint_rank0(*args, **kwargs):
+def eprint(*args, **kwargs):
     if int(os.getenv("RANK", "0")) == 0:
         print(*args, file=sys.stderr, **kwargs)
         sys.stderr.flush()
@@ -258,10 +258,10 @@ if __name__ == "__main__":
 
     script_args = parser.parse_args()
 
-    print_rank0(f"Generating {script_args.num_examples} synthetic examples...")
+    print(f"Generating {script_args.num_examples} synthetic examples...")
     text_examples = generate_examples(script_args.num_examples)
 
-    print_rank0(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
+    print(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.tokenizer_name_or_path, trust_remote_code=True
     )
@@ -274,22 +274,22 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         if tokenizer.eos_token:
             tokenizer.pad_token = tokenizer.eos_token
-            print_rank0(
+            print(
                 f"Set tokenizer.pad_token to tokenizer.eos_token: {tokenizer.eos_token}"
             )
         else:
             tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # Fallback
-            print_rank0("Added [PAD] as pad_token.")
+            print("Added [PAD] as pad_token.")
 
     all_input_ids = []
     all_attention_masks = []
     all_labels = []
 
-    print_rank0("Tokenizing and creating labels for generated examples...")
+    print("Tokenizing and creating labels for generated examples...")
     for i, text_content in enumerate(text_examples):
         if int(os.getenv("RANK", "0")) == 0 and i < 2:  # Print first 2 formatted texts
-            print_rank0(f"\n--- Generated Example {i + 1} Text (to be tokenized) ---")
-            print_rank0(
+            print(f"\n--- Generated Example {i + 1} Text (to be tokenized) ---")
+            print(
                 text_content[:1000] + "..."
                 if len(text_content) > 1000
                 else text_content
@@ -329,8 +329,8 @@ if __name__ == "__main__":
         features=features,
     )
 
-    print_rank0(
+    print(
         f"Saving processed dataset with {len(hf_dataset)} examples to {script_args.output_path}..."
     )
     hf_dataset.save_to_disk(script_args.output_path)
-    print_rank0("--- Synthetic Dataset Generation Complete ---")
+    print("--- Synthetic Dataset Generation Complete ---")
