@@ -157,7 +157,9 @@ if args.use_qlora:
 # replace LoRA linear layers with FP8 (optional)
 def fp8_ctx():
     if args.use_fp8 and TE_OK:
-        recipe = DelayedScaling(fp8_format="HYBRID", margin=0)
+        from transformer_engine.common.recipe import Format  # Import the Enum
+
+        recipe = DelayedScaling(fp8_format=Format.HYBRID, margin=0)
         return fp8_autocast(enabled=True, recipe=recipe)
     return nullcontext()
 
