@@ -45,7 +45,7 @@ FINETUNE_ARGS="--output_dir=${CONT_JOBDIR}/checkpoints \
   --processed_dataset_path=${CONT_DATADIR} \
   --use_qlora \
   --use_fp8 \
-  --gradient_checkpointing"
+  --batch_size_per_device=4"
 
 TORCHRUN_CMD="\
 torchrun \

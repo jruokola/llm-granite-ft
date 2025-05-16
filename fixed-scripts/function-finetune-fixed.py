@@ -130,7 +130,7 @@ tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
-amp_dtype = torch.bfloat16 if not args.disable_amp else torch.float32
+amp_dtype = torch.float16 if not args.disable_amp else torch.float32
 scaler = GradScaler() if not args.disable_amp else None
 
 bnb_cfg = BitsAndBytesConfig(
