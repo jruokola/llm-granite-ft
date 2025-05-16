@@ -109,6 +109,7 @@ args = cli.parse_args()
 
 
 # ────────────── Logging & distributed init ─────────────────
+# Define these early as they might be used by test toggles below
 def print_rank0_info(msg):
     if int(os.getenv("RANK", "0")) == 0:
         print(f"[INFO] {msg}", flush=True)
@@ -155,6 +156,42 @@ class Split(Dataset):  # (Content unchanged)
 tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
+
+# Set pad_token if not already set (mirroring generation script)
+if tok.pad_token is None:
+    if tok.eos_token:
+        tok.pad_token = tok.eos_token
+        print_rank0_info(
+            f"Set tokenizer.pad_token to tokenizer.eos_token: {tok.eos_token}"
+        )
+    else:
+        # Add a standard pad token if no EOS token is available
+        tok.add_special_tokens({"pad_token": "[PAD]"})
+        print_rank0_info("Added [PAD] as pad_token, as eos_token was not found.")
+
+# Define and add Granite-specific special tokens
+# Based on generate_granite_fc_examples.py and IBM Granite documentation
+SOT = "<|start_of_role|>"
+EOTR = "<|end_of_role|>"
+EOTXT = "<|end_of_text|>"
+TOOL_CALL_MARKER_GRANITE = "<|tool_call|>"
+# Note: Roles like "system", "user", "assistant", "available_tools", "tool_response"
+# are part of the string construction, not necessarily separate special tokens themselves,
+# unless the base tokenizer for Granite treats them as such. The key structural tokens are above.
+# FIM tokens like <fim_prefix>, <fim_suffix>, <fim_middle> are for FIM tasks, not directly function calling.
+
+granite_special_tokens = [SOT, EOTR, EOTXT, TOOL_CALL_MARKER_GRANITE]
+newly_added_tokens = []
+for special_token in granite_special_tokens:
+    if special_token not in tok.vocab:
+        newly_added_tokens.append(special_token)
+
+if newly_added_tokens:
+    tok.add_special_tokens({"additional_special_tokens": newly_added_tokens})
+    print_rank0_info(f"Added new special tokens: {newly_added_tokens}")
+else:
+    print_rank0_info("Granite special tokens already exist in tokenizer vocabulary.")
+
 
 # Configure amp_dtype and GradScaler
 scaler = None
@@ -221,6 +258,18 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=model_load_torch_dtype,  # Use the determined loading dtype
     trust_remote_code=True,
 )
+
+# Resize token embeddings if new special tokens were added
+if newly_added_tokens:
+    model.resize_token_embeddings(len(tok))
+    print_rank0_info(
+        f"Resized model token embeddings to {len(tok)} to accommodate new special tokens."
+    )
+    # After resizing, it's good practice to check the embedding layer's new size.
+    # For many models, this is model.get_input_embeddings().weight.size(0)
+    # or model.transformer.wte.weight.size(0) for GPT-like models.
+    # This check can be added if further debugging is needed.
+
 # ... (rest of model setup, LoRA, FP8 adapter swap, FSDP wrapping etc. remains the same as the last provided full file) ...
 if args.gradient_checkpointing:
     model.config.use_cache = False
@@ -485,12 +534,16 @@ for ep in range(args.num_epochs):
             else nullcontext(),
             fp8_ctx(),
         ):
-            loss = model(**batch).loss
+            raw_loss = model(**batch).loss
+            # Cast to float32 for accumulation and division to improve stability
+            loss = raw_loss.float()
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+
+        # Check for NaN/inf in the loss *before* backward pass
         if torch.isinf(loss).any() or torch.isnan(loss).any():
             print_rank0_error(
-                f"Rank {rank} - Loss became inf/nan BEFORE backward: {loss.item()}. Skipping step."
+                f"Rank {rank} - Loss became inf/nan BEFORE backward (value: {loss.item()}). Raw loss: {raw_loss.item()}. Skipping step."
             )
             opt.zero_grad()
             continue
@@ -500,13 +553,39 @@ for ep in range(args.num_epochs):
             loss.backward()
         if step % args.gradient_accumulation_steps == 0:
             if scaler:
-                scaler.unscale_(opt)
+                scaler.unscale_(opt)  # Unscale before clipping
+
+            # Check for NaN/inf in gradients *after* unscaling and *before* clipping/optimizer step
+            # This requires iterating through model parameters if FSDP is used.
+            # For simplicity, we'll check the loss again, assuming if loss was fine,
+            # and backward didn't explode, grads *might* be okay.
+            # A more thorough check would involve FSDP's API to inspect grad norms if available,
+            # or summing squared grads.
+            # However, the FSDP clip_grad_norm_ itself might raise errors if grads are NaN.
+
             if not args.no_fsdp:
+                # Potentially, FSDP's clip_grad_norm_ might handle/error on NaN grads internally.
+                # The warning "Called FSDP.clip_grad_norm_() on rank 0 with no gradients"
+                # from the initial problem description suggests that sometimes gradients might be zero
+                # or not computed, which is different from NaN.
                 model.clip_grad_norm_(1.0)
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # Final check before optimizer step
+            # This is tricky because gradients are distributed.
+            # We rely on the optimizer step or scaler.step() to potentially fail or log if issues persist.
+
             if scaler:
-                scaler.step(opt)
+                # scaler.step() can have issues if grads are NaN/inf
+                scaler_step_output = scaler.step(opt)
+                # scaler_step_output is None if gradients were not finite.
+                if scaler_step_output is None and rank == 0:
+                    print_rank0_error(
+                        f"Rank {rank} - scaler.step() reported non-finite gradients. Skipping optimizer update."
+                    )
+                    # Grads were not finite, optimizer not stepped.
+                    # We might need to zero_grad again if opt.step wasn't called.
                 scaler.update()
             else:
                 opt.step()

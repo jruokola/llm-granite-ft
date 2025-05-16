@@ -4,7 +4,7 @@ This project supports fine-tuning Large Language Models for two distinct tasks:
 
 1. **CodeLlama for Chess**: Fine-tunes a CodeLlama LLM (e.g., `codellama/CodeLlama-7b-hf`) on a chess dataset (`strategic_game_chess.jsonl`) using PyTorch Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
-2. **Granite-3.3B-Instruct for Function Calling**: Fine-tunes an IBM Granite model (e.g., `ibm-granite/granite-3.3-2b-instruct`) using a synthetically generated dataset for function calling, orchestrated with PyTorch DDP/FSDP. For demonstration and testing purposes, external datasets like `glaiveai/glaive-function-calling-v2` or `NousResearch/hermes-function-calling-v1` are not currently used due to previous processing challenges.
+2. **Granite-3.3-2B-Instruct for Function Calling**: Fine-tunes an IBM Granite model (e.g., `ibm-granite/granite-3.3-2b-instruct`) using a synthetically generated dataset for function calling, orchestrated with PyTorch DDP/FSDP. For demonstration and testing purposes, external datasets like `glaiveai/glaive-function-calling-v2` or `NousResearch/hermes-function-calling-v1` are not currently used due to previous processing challenges.
 
 Both fine-tuning processes are orchestrated using Slurm for distributed training on a Nebius Kubernetes cluster.
 
@@ -143,7 +143,7 @@ This script is used to launch `fixed-scripts/function-finetune-fixed.py`. Place 
   * `--output_dir` is set to `${CONT_JOBDIR}/checkpoints` (where `CONT_JOBDIR` is `/job_data` inside the container).
   * `--processed_dataset_path` should be set to the path where the synthetic dataset was saved by `generate_granite_fc_examples.py` (e.g., `/path/on/shared/storage/my_synthetic_fc_dataset` if generated outside the container, or a path within the container if copied during image build or mounted). The sbatch script example might use a placeholder like `/job_data/synthetic_dataset` which you would need to ensure is correctly populated or mounted.
   * `--use_qlora` is passed by default, enabling QLoRA.
-  * `--use_fp8` is also passed by default in the sbatch script, enabling FP8 for LoRA layers if `transformer_engine` is available and other conditions are met (e.g., compatible `lora_r`).
+  * `--use_fp8` is also passed by default in the sbatch script, enabling FP8 for LoRA layers if `transformer_engine` is available and other conditions are met (e.g., compatible `lora_r`). 
   * The `--disable_amp` argument is **not** passed by default in the current sbatch script. The Python script `function-finetune-fixed.py` now handles AMP logic internally (e.g., BF16 without GradScaler by default if AMP is on and FP8 is off).
   * Other arguments for `function-finetune-fixed.py` (e.g., `--batch_size_per_device`, `--learning_rate`, other LoRA parameters) can be added to `FINETUNE_ARGS` in the sbatch script.
   * **Important Considerations for `FINETUNE_ARGS` (previously `FINETUNE_CLI_ARGS`):**

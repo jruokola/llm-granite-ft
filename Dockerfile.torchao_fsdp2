@@ -1,0 +1,43 @@
+# ────────────────────────────────────────────────────────────────────────────
+# GPU-ready HuggingFace stack + PEFT + FSDP2 + torchao FP8 fine-tuning
+# ────────────────────────────────────────────────────────────────────────────
+FROM nvcr.io/nvidia/pytorch:25.04-py3
+
+# 1 — Basic runtime hygiene
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
+    CUDA_LAUNCH_BLOCKING=0
+
+WORKDIR /workspace
+
+# --- System build tools ------------------------------------------------------
+# Kept from original, useful for building some pip packages if they have C/C++ extensions
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake git && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2 — Python dependencies
+#     NOTE: `transformers` is already in the base image.
+#     We ensure pip is upgraded, then install torchao, peft, datasets, accelerate, bitsandbytes.
+#     Transformer Engine is removed as torchao is used for FP8.
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install \
+        peft \
+        datasets \
+        transformers \
+        huggingface_hub[hf_xet] \
+        bitsandbytes && \
+    USE_CPP=0 python3 -m pip install git+https://github.com/pytorch/ao.git # Install torchao
+# accelerate is removed as the script uses torch.distributed directly for FSDP
+
+# 3 — Copy training code and data
+# Copy the new FSDP2 + torchao script
+COPY fixed-scripts/function-finetune-torchao-fsdp2.py .
+# Assuming the same dataset path is used
+COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
+
+# 4 — No CMD: Invoke with torchrun / sbatch
+# Example for running (adjust as needed):
+# torchrun --nproc_per_node=NUM_GPUS function-finetune-torchao-fsdp2.py --use_fp8_torchao ... [other args]
