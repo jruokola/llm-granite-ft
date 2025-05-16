@@ -195,31 +195,79 @@ if args.use_fp8 and TE_OK:
 
     log.info("LoRA adapters swapped to FP8 TE layers.")
 
+# Cast parameters of non-BitsAndBytes modules to amp_dtype before FSDP
+# This ensures uniformity for parameters FSDP will handle.
+# PEFT might upcast LayerNorms/lm_head to float32; this brings them to amp_dtype.
+fsdp_ignored_modules = []
+if args.use_qlora:  # Only ignore BnB modules if QLoRA is active
+    for module_name, module in model.named_modules():
+        if "bitsandbytes.nn.modules" in str(type(module)).lower():
+            # Check if module is already added to avoid duplicates if nested
+            is_already_added = False
+            for added_module in fsdp_ignored_modules:
+                if module is added_module:
+                    is_already_added = True
+                    break
+            if not is_already_added:
+                fsdp_ignored_modules.append(module)
+
+for module_name, module in model.named_modules():
+    is_ignored_for_casting = False
+    for ignored_type_module in fsdp_ignored_modules:
+        if module is ignored_type_module:  # Check actual module instance
+            is_ignored_for_casting = True
+            break
+
+    if is_ignored_for_casting:
+        continue  # Skip casting parameters of ignored (BnB) modules
+
+    for param_name, param in module.named_parameters(recurse=False):
+        if param.dtype != amp_dtype:
+            # Avoid casting LoRA FP8 layers if they are handled by Transformer Engine
+            is_te_fp8_lora = False
+            if args.use_fp8 and TE_OK and "lora_" in param_name:
+                # Check if the module is a TE Linear layer
+                if hasattr(te, "pytorch") and isinstance(module, te.pytorch.Linear):
+                    is_te_fp8_lora = True
+
+            if not is_te_fp8_lora:
+                if rank == 0:
+                    # This logging can be very verbose, enable if needed for deep debugging
+                    # log.info(f"Casting {module_name}.{param_name} from {param.dtype} to {amp_dtype}")
+                    pass
+                param.data = param.data.to(amp_dtype)
+
+if rank == 0:
+    log.info(
+        f"Dtype histogram before FSDP: {Counter(p.dtype for p in model.parameters())}"
+    )
+    # To see which modules are being ignored by FSDP:
+    # log.info(f"FSDP ignored_modules types: {[type(m) for m in fsdp_ignored_modules]}")
+
+
 # ──────── FSDP (single shard → ignore int8 safely) ─────────
 if not args.no_fsdp:
-    int8_mods = [
-        m
-        for m in model.modules()
-        if any(p.dtype == torch.int8 for p in m.parameters(recurse=False))
-    ]
-    # torch.compile only if available (PT>=2.1) and not inside TE context.
-    if hasattr(torch, "compile"):
+    # torch.compile can be applied before or after FSDP.
+    # If applied before, FSDP wraps the compiled module.
+    # If after, FSDP itself is compiled (less common for FSDP itself).
+    # Let's keep it before FSDP for now as in the original script.
+    if hasattr(torch, "compile") and not (
+        args.use_fp8 and TE_OK
+    ):  # TE and compile can conflict
         model = torch.compile(model, backend="inductor", mode="max-autotune")
 
-    # Define the mixed precision policy for FSDP
-    # This aligns FSDP's parameter dtype with the script's amp_dtype
     mixed_precision_policy = MixedPrecision(
         param_dtype=amp_dtype,
-        reduce_dtype=amp_dtype,  # Dtype for gradient reduction
-        buffer_dtype=amp_dtype,  # Dtype for buffers
+        reduce_dtype=amp_dtype,
+        buffer_dtype=amp_dtype,
     )
 
     model = FSDP(
         model,
         device_id=device,
-        use_orig_params=True,
-        ignored_modules=int8_mods,
-        sync_module_states=True,
+        use_orig_params=True,  # Crucial for PEFT/QLoRA
+        ignored_modules=fsdp_ignored_modules if args.use_qlora else None,
+        sync_module_states=True,  # Ensure all ranks start with the same model states
         mixed_precision=mixed_precision_policy,
     )
 else:
