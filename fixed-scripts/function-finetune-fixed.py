@@ -74,7 +74,7 @@ cli.add_argument("--processed_dataset_path", required=True)
 cli.add_argument("--output_dir", default="./checkpoints")
 # LoRA / QLoRA
 cli.add_argument("--use_qlora", action="store_true")
-cli.add_argument("--lora_r", type=int, default=8)
+cli.add_argument("--lora_r", type=int, default=16)
 cli.add_argument("--lora_alpha", type=int, default=32)
 cli.add_argument("--lora_dropout", type=float, default=0.05)
 cli.add_argument("--lora_target_modules", default="q_proj,v_proj")
