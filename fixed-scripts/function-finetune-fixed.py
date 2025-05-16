@@ -132,30 +132,33 @@ tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
-scaler = None  # Initialize scaler
+# Configure amp_dtype and GradScaler based on args
 if args.disable_amp:
     amp_dtype = torch.float32
-    scaler = None  # Explicitly None
+    scaler = None
     if rank == 0:
         print("[INFO] AMP disabled. Training in FP32.")
+        sys.stdout.flush()
 else:  # AMP is enabled
     if not args.use_fp8:
-        # If FP8 is NOT used, prefer bfloat16 and try GradScaler
+        # FP8 is NOT used: prefer bfloat16 and try GradScaler
         amp_dtype = torch.bfloat16
-        scaler = GradScaler()
+        scaler = (
+            GradScaler()
+        )  # This might hit the RuntimeError with certain PyTorch versions
         if rank == 0:
             print(f"[INFO] AMP enabled with {amp_dtype} and GradScaler (FP8 disabled).")
+            sys.stdout.flush()
     else:
-        # If FP8 IS used, stick to float16 and no GradScaler (due to previous issues)
+        # FP8 IS used: stick to float16 (due to FP8 conversion preferences)
+        # and no GradScaler (due to FSDP+FP16 params not needing it / causing errors)
         amp_dtype = torch.float16
         scaler = None
         if rank == 0:
             print(
                 f"[INFO] AMP enabled with {amp_dtype} (FP8 enabled). GradScaler is disabled."
             )
-
-if rank == 0:
-    sys.stdout.flush()
+            sys.stdout.flush()
 
 
 bnb_cfg = BitsAndBytesConfig(
