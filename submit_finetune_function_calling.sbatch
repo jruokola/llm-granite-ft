@@ -1,4 +1,3 @@
-  GNU nano 6.2                                       submit_finetune_function_calling.sbatch *                                              
 #!/bin/bash
 #SBATCH --job-name=fc-qlora-h100
 #SBATCH --nodes=2                # one H100 per node
@@ -34,7 +33,6 @@ echo "CONTAINER_MOUNTS ${CONTAINER_MOUNTS}"
 export WORLD_SIZE=${SLURM_NNODES}
 export RANK=${SLURM_PROCID}
 export LOCAL_RANK=${SLURM_LOCALID}
-export WORLD_SIZE=${SLURM_NTASKS}
 export NCCL_DEBUG=WARN
 export PYXIS_VERBOSE=3
 export TORCH_DISTRIBUTED_TIMEOUT=1800
@@ -62,7 +60,7 @@ torchrun \
 ############################ 4. launch containers #############################
 ## ─── Launch with srun + env:// init ──────────────────────────────────────────
 srun \
-     --export=ALL,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FO>
+     --export=ALL,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,NCLL_DEBUG,WORLD_SIZE,LOCAL_RANK,RANK \
      --container-image=${IMAGE} \
      --container-mounts=${CONTAINER_MOUNTS} \
      --container-workdir="/workspace" \
