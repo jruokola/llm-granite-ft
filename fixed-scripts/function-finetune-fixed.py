@@ -11,7 +11,6 @@ QLoRA + LoRA fine-tuning on 2 × H100 (1 GPU / node) with single-shard FSDP.
 
 # ───────────────────────── Std lib ──────────────────────────
 import argparse
-import logging
 import math
 import os
 import subprocess
@@ -81,38 +80,7 @@ cli.add_argument("--use_fp8", action="store_true", help="Enable FP8 on H100")
 args = cli.parse_args()
 
 # ────────────── Logging & distributed init ─────────────────
-rank_for_log_check = int(os.getenv("RANK", "0"))  # Default to "0" if not set for safety
-
-log_level = logging.INFO if rank_for_log_check == 0 else logging.WARNING
-log_format = "[%(asctime)s] [%(levelname)s] [rank%(rank)s] %(message)s"
-
-# Basic config for all ranks (might go to stderr or be captured by torchrun)
-logging.basicConfig(level=log_level, format=log_format)
-# Create a root logger instance to add handlers if needed
-# log = logging.getLogger("finetune") # This creates a child logger
-log = logging.getLogger()  # Get the root logger
-log.setLevel(log_level)  # Ensure root logger level is set
-
-# For Rank 0, add a handler to explicitly write to stdout and a file
-if rank_for_log_check == 0:
-    # Ensure Rank 0 also logs to stdout
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.INFO)
-    stdout_handler.setFormatter(logging.Formatter(log_format))
-    log.addHandler(stdout_handler)
-
-    # Add a file handler for Rank 0 for diagnostics
-    # Ensure output_dir is available or adjust path
-    # This part might need to be after args are parsed if output_dir is from args
-    # For now, let's try a fixed path within the job's mounted directory if possible,
-    # or defer this if args.output_dir is needed.
-    # Assuming CONT_JOBDIR is /job_data as per sbatch, and it's writable.
-    # We'll add this after args parsing.
-
-# Add rank to log messages for clarity
-extra_log_info = {"rank": rank_for_log_check}
-log = logging.LoggerAdapter(log, extra_log_info)
-
+# Removed logging setup. Using print statements for output.
 
 # Check for lora_r compatibility with FP8 if QLoRA and FP8 are enabled
 if args.use_fp8 and TE_OK and args.use_qlora and (args.lora_r % 16 != 0):
@@ -120,18 +88,25 @@ if args.use_fp8 and TE_OK and args.use_qlora and (args.lora_r % 16 != 0):
         f"FP8 execution with QLoRA requires --lora_r to be a multiple of 16. "
         f"Current --lora_r is {args.lora_r}. Please adjust --lora_r (e.g., to 16, 32, etc.)."
     )
-    log.error(error_msg)  # Log the error
     # Rank 0 is typically responsible for user-facing messages.
-    if int(os.getenv("RANK", 0)) == 0:
-        print(f"CRITICAL ERROR: {error_msg}", file=sys.stderr)
+    if int(os.getenv("RANK", "0")) == 0:  # Default to "0" if RANK is not set
+        print(f"[ERROR] {error_msg}", file=sys.stderr)
+        print(
+            f"CRITICAL ERROR: {error_msg}", file=sys.stderr
+        )  # Keep critical error for visibility
     # Exit all processes. This check is before dist.init_process_group(), so direct exit is fine.
     sys.exit(1)
 
 dist.init_process_group("nccl")
-rank, local_rank = int(os.getenv("RANK", 0)), int(os.getenv("LOCAL_RANK", 0))
+rank, local_rank = (
+    int(os.getenv("RANK", "0")),
+    int(os.getenv("LOCAL_RANK", "0")),
+)  # Default to "0"
 torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
-log.info(f"[rank {rank}] ready on {torch.cuda.get_device_name(device)}")
+if rank == 0:
+    print(f"[INFO] [rank {rank}] ready on {torch.cuda.get_device_name(device)}")
+    sys.stdout.flush()
 
 
 # ───────────── Dataset wrapper (already tokenised) ─────────
@@ -156,48 +131,19 @@ tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
-# Setup file logging for Rank 0 after args are parsed (to use args.output_dir)
-if rank_for_log_check == 0:
-    try:
-        # Try to create a log file in a shared/mounted directory
-        # Assuming CONT_JOBDIR from sbatch is mounted at /job_data
-        # and args.output_dir is relative to /workspace or an absolute path
-        # Let's use a path we expect to be writable from sbatch mounts
-        # This assumes CONT_JOBDIR is accessible as /job_data
-        # and args.output_dir is like "./checkpoints" (relative to /workspace)
-        # A safer bet might be to use a fixed path in /job_data if output_dir isn't absolute
-
-        # Let's try to make a log file in the job's mounted directory
-        # The sbatch script mounts JOB_DIR to CONT_JOBDIR (/job_data)
-        # So, we can try to log into /job_data
-        rank0_logfile_path = "/job_data/rank0_debug.log"
-        os.makedirs(os.path.dirname(rank0_logfile_path), exist_ok=True)
-        file_handler = logging.FileHandler(rank0_logfile_path)
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(logging.Formatter(log_format))
-        # Get the root logger again to add this handler
-        logging.getLogger().addHandler(file_handler)
-        log.info(f"Rank 0 logging additionally to {rank0_logfile_path}")
-    except Exception as e:
-        log.error(f"Failed to set up Rank 0 file logging: {e}")
-
-
 scaler = None
 if args.disable_amp:
     amp_dtype = torch.float32
-    log.info("AMP disabled. Training in FP32.")
+    if rank == 0:
+        print("[INFO] AMP disabled. Training in FP32.")
 else:
-    # Default to float16 for AMP if bfloat16 causes issues with GradScaler or specific kernels
-    # As per FSDP docs, GradScaler is not typically used when FSDP param_dtype is float16.
     amp_dtype = torch.float16
-    log.info(
-        f"AMP enabled with {amp_dtype}. GradScaler is disabled as FSDP handles FP16 params."
-    )
-    # If BFloat16 + GradScaler were to be attempted again, it would be:
-    # from torch.amp import GradScaler # Import would be needed
-    # amp_dtype = torch.bfloat16
-    # scaler = GradScaler()
-    # log.info(f"AMP enabled with {amp_dtype} and GradScaler.")
+    if rank == 0:
+        print(
+            f"[INFO] AMP enabled with {amp_dtype}. GradScaler is disabled as FSDP handles FP16 params."
+        )
+if rank == 0:
+    sys.stdout.flush()
 
 
 bnb_cfg = BitsAndBytesConfig(
@@ -221,7 +167,9 @@ if args.gradient_checkpointing:
 else:
     model.config.use_cache = True  # Or default, depending on model's original config
 
-log.info(f"Dtype histogram: {Counter(p.dtype for p in model.parameters())}")
+if rank == 0:
+    print(f"[INFO] Dtype histogram: {Counter(p.dtype for p in model.parameters())}")
+    sys.stdout.flush()
 
 # attach LoRA
 if args.use_qlora:
@@ -246,9 +194,12 @@ if args.use_qlora:
         actual_model_to_checkpoint.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        log.info(
-            "Gradient checkpointing enabled with use_reentrant=False on the base model."
-        )
+        if rank == 0:
+            print(
+                "[INFO] Gradient checkpointing enabled with use_reentrant=False on the base model."
+            )
+        if rank == 0:
+            sys.stdout.flush()
 
     lconf = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -303,7 +254,10 @@ if args.use_fp8 and TE_OK:
             # set the new FP8 layer in place of the old Linear
             setattr(parent_mod, child_name, repl)
 
-    log.info("LoRA adapters swapped to FP8 TE layers.")
+    if rank == 0:
+        print("[INFO] LoRA adapters swapped to FP8 TE layers.")
+    if rank == 0:
+        sys.stdout.flush()
 
 # Cast parameters of non-BitsAndBytes modules to amp_dtype before FSDP
 # This ensures uniformity for parameters FSDP will handle.
@@ -348,11 +302,12 @@ for module_name, module in model.named_modules():
                 param.data = param.data.to(amp_dtype)
 
 if rank == 0:
-    log.info(
-        f"Dtype histogram before FSDP: {Counter(p.dtype for p in model.parameters())}"
+    print(
+        f"[INFO] Dtype histogram before FSDP: {Counter(p.dtype for p in model.parameters())}"
     )
     # To see which modules are being ignored by FSDP:
-    # log.info(f"FSDP ignored_modules types: {[type(m) for m in fsdp_ignored_modules]}")
+    # print(f"[INFO] FSDP ignored_modules types: {[type(m) for m in fsdp_ignored_modules]}")
+    sys.stdout.flush()
 
 
 # ──────── FSDP (single shard → ignore int8 safely) ─────────
@@ -447,14 +402,19 @@ def save(tag):
     os.makedirs(path, exist_ok=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
         model.module.save_pretrained(path)
-    log.info(f"✓ checkpoint {tag}")
+    if rank == 0:
+        print(f"[INFO] ✓ checkpoint {tag}")
+    if rank == 0:
+        sys.stdout.flush()
 
 
 # ───────────────────── Main train loop ─────────────────────
-if rank == 0:  # Use the script's 'rank' variable now, not rank_for_log_check
+if rank == 0:
     os.makedirs(args.output_dir, exist_ok=True)
-    log.info(subprocess.check_output(["nvidia-smi"]).decode().strip())
-    sys.stdout.flush()  # Explicit flush
+    print(
+        f"[INFO] nvidia-smi output:\n{subprocess.check_output(['nvidia-smi']).decode().strip()}"
+    )
+    sys.stdout.flush()
 
 model.train()
 gstep = 0
@@ -485,18 +445,21 @@ for ep in range(args.num_epochs):
             sched.step()
             gstep += 1
 
-            if gstep % 100 == 0 and rank == 0:  # Use the script's 'rank' variable
-                log.info(f"E{ep + 1} S{gstep} loss {loss.item():.4f}")
-                sys.stdout.flush()  # Explicit flush
+            if gstep % 100 == 0 and rank == 0:
+                print(f"[INFO] E{ep + 1} S{gstep} loss {loss.item():.4f}")
+                sys.stdout.flush()
 
             if gstep % 500 == 0:
                 vl = val_loss()
                 if rank == 0:
                     mb = torch.cuda.max_memory_allocated() / 1e9
-                    log.info(f"eval {vl:.4f} (best {best:.4f}) - {mb:.1f} GB max_alloc")
+                    print(
+                        f"[INFO] eval {vl:.4f} (best {best:.4f}) - {mb:.1f} GB max_alloc"
+                    )
+                    sys.stdout.flush()
                     if vl < best:
                         best = vl
-                        save("best")
+                        save("best")  # save already prints and flushes
 
             if 0 < args.max_training_steps == gstep:
                 break
