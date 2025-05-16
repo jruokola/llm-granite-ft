@@ -59,7 +59,7 @@ except ModuleNotFoundError:  # container w/o TE
 # ──────────────────────── CLI args ─────────────────────────
 cli = argparse.ArgumentParser()
 # infra
-cli.add_argument("--batch_size_per_device", type=int, default=128)
+cli.add_argument("--batch_size_per_device", type=int, default=16)
 cli.add_argument("--gradient_accumulation_steps", type=int, default=4)
 cli.add_argument("--learning_rate", type=float, default=6e-5)
 cli.add_argument("--num_epochs", type=int, default=3)
