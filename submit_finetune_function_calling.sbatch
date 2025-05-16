@@ -39,6 +39,7 @@ export TORCH_DISTRIBUTED_TIMEOUT=1800
 export HF_DATASETS_CACHE=${CONT_JOB_DIR}/hf_cache
 export TOKENIZERS_PARALLELISM=false
 export FLASH_ATTENTION_FORCE_CUDA=1
+export PYTHONUNBUFFERED=1 # Force unbuffered Python output
 
 ############################ 3. python CLI ####################################
 FINETUNE_ARGS="--output_dir=${CONT_JOBDIR}/checkpoints \
@@ -60,7 +61,7 @@ torchrun \
 ############################ 4. launch containers #############################
 ## ─── Launch with srun + env:// init ──────────────────────────────────────────
 srun \
-     --export=ALL,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,NCLL_DEBUG,WORLD_SIZE,LOCAL_RANK,RANK \
+     --export=ALL,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,NCCL_DEBUG,PYTHONUNBUFFERED,WORLD_SIZE,LOCAL_RANK,RANK \
      --container-image=${IMAGE} \
      --container-mounts=${CONTAINER_MOUNTS} \
      --container-workdir="/workspace" \

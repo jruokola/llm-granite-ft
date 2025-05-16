@@ -81,11 +81,38 @@ cli.add_argument("--use_fp8", action="store_true", help="Enable FP8 on H100")
 args = cli.parse_args()
 
 # ────────────── Logging & distributed init ─────────────────
-logging.basicConfig(
-    level=logging.INFO if int(os.getenv("RANK", 0)) == 0 else logging.WARNING,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("finetune")
+rank_for_log_check = int(os.getenv("RANK", "0"))  # Default to "0" if not set for safety
+
+log_level = logging.INFO if rank_for_log_check == 0 else logging.WARNING
+log_format = "[%(asctime)s] [%(levelname)s] [rank%(rank)s] %(message)s"
+
+# Basic config for all ranks (might go to stderr or be captured by torchrun)
+logging.basicConfig(level=log_level, format=log_format)
+# Create a root logger instance to add handlers if needed
+# log = logging.getLogger("finetune") # This creates a child logger
+log = logging.getLogger()  # Get the root logger
+log.setLevel(log_level)  # Ensure root logger level is set
+
+# For Rank 0, add a handler to explicitly write to stdout and a file
+if rank_for_log_check == 0:
+    # Ensure Rank 0 also logs to stdout
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.setFormatter(logging.Formatter(log_format))
+    log.addHandler(stdout_handler)
+
+    # Add a file handler for Rank 0 for diagnostics
+    # Ensure output_dir is available or adjust path
+    # This part might need to be after args are parsed if output_dir is from args
+    # For now, let's try a fixed path within the job's mounted directory if possible,
+    # or defer this if args.output_dir is needed.
+    # Assuming CONT_JOBDIR is /job_data as per sbatch, and it's writable.
+    # We'll add this after args parsing.
+
+# Add rank to log messages for clarity
+extra_log_info = {"rank": rank_for_log_check}
+log = logging.LoggerAdapter(log, extra_log_info)
+
 
 # Check for lora_r compatibility with FP8 if QLoRA and FP8 are enabled
 if args.use_fp8 and TE_OK and args.use_qlora and (args.lora_r % 16 != 0):
@@ -128,6 +155,32 @@ class Split(Dataset):
 tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
+
+# Setup file logging for Rank 0 after args are parsed (to use args.output_dir)
+if rank_for_log_check == 0:
+    try:
+        # Try to create a log file in a shared/mounted directory
+        # Assuming CONT_JOBDIR from sbatch is mounted at /job_data
+        # and args.output_dir is relative to /workspace or an absolute path
+        # Let's use a path we expect to be writable from sbatch mounts
+        # This assumes CONT_JOBDIR is accessible as /job_data
+        # and args.output_dir is like "./checkpoints" (relative to /workspace)
+        # A safer bet might be to use a fixed path in /job_data if output_dir isn't absolute
+
+        # Let's try to make a log file in the job's mounted directory
+        # The sbatch script mounts JOB_DIR to CONT_JOBDIR (/job_data)
+        # So, we can try to log into /job_data
+        rank0_logfile_path = "/job_data/rank0_debug.log"
+        os.makedirs(os.path.dirname(rank0_logfile_path), exist_ok=True)
+        file_handler = logging.FileHandler(rank0_logfile_path)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        # Get the root logger again to add this handler
+        logging.getLogger().addHandler(file_handler)
+        log.info(f"Rank 0 logging additionally to {rank0_logfile_path}")
+    except Exception as e:
+        log.error(f"Failed to set up Rank 0 file logging: {e}")
+
 
 scaler = None
 if args.disable_amp:
@@ -398,9 +451,10 @@ def save(tag):
 
 
 # ───────────────────── Main train loop ─────────────────────
-if rank == 0:
+if rank == 0:  # Use the script's 'rank' variable now, not rank_for_log_check
     os.makedirs(args.output_dir, exist_ok=True)
     log.info(subprocess.check_output(["nvidia-smi"]).decode().strip())
+    sys.stdout.flush()  # Explicit flush
 
 model.train()
 gstep = 0
@@ -431,8 +485,9 @@ for ep in range(args.num_epochs):
             sched.step()
             gstep += 1
 
-            if gstep % 100 == 0 and rank == 0:
+            if gstep % 100 == 0 and rank == 0:  # Use the script's 'rank' variable
                 log.info(f"E{ep + 1} S{gstep} loss {loss.item():.4f}")
+                sys.stdout.flush()  # Explicit flush
 
             if gstep % 500 == 0:
                 vl = val_loss()
