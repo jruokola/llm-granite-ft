@@ -191,6 +191,22 @@ else:  # AMP enabled, FP8 not used
             f"Invalid amp_precision_mode: {args.amp_precision_mode}. Defaulting to BF16. GradScaler disabled."
         )
 
+# Determine model_load_torch_dtype for AutoModelForCausalLM.from_pretrained
+if args.use_qlora:
+    if amp_dtype == torch.bfloat16:  # If amp_dtype ended up as bfloat16
+        model_load_torch_dtype = torch.bfloat16
+        print_rank0_info(
+            "QLoRA active: Loading base model in torch.bfloat16 for non-quantized parts."
+        )
+    else:  # amp_dtype is float16 or float32
+        model_load_torch_dtype = torch.float32
+        print_rank0_info(
+            f"QLoRA active: Loading base model in torch.float32 for non-quantized parts. QLoRA compute dtype: {amp_dtype}."
+        )
+else:  # Not using QLoRA
+    model_load_torch_dtype = amp_dtype
+    print_rank0_info(f"QLoRA not active: Loading model in {model_load_torch_dtype}.")
+
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=args.use_qlora,
     bnb_4bit_quant_type="nf4",
@@ -202,7 +218,7 @@ model = AutoModelForCausalLM.from_pretrained(
     args.model_name_or_path,
     cache_dir=".cache",
     quantization_config=bnb_cfg if args.use_qlora else None,
-    torch_dtype=amp_dtype,
+    torch_dtype=model_load_torch_dtype,  # Use the determined loading dtype
     trust_remote_code=True,
 )
 # ... (rest of model setup, LoRA, FP8 adapter swap, FSDP wrapping etc. remains the same as the last provided full file) ...
@@ -314,9 +330,21 @@ if not args.no_fsdp:
                 print_rank0_error(
                     f"torch.compile BEFORE FSDP failed: {e}. Proceeding with uncompiled model."
                 )
-    mixed_precision_policy = MixedPrecision(
-        param_dtype=amp_dtype, reduce_dtype=amp_dtype, buffer_dtype=amp_dtype
-    )
+    if amp_dtype == torch.float16:
+        # More conservative mixed precision for FP16 to enhance stability
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.float16,  # Model parameters compute in FP16
+            reduce_dtype=torch.float32,  # Gradients reduced in FP32
+            buffer_dtype=torch.float32,  # Buffers (e.g., LayerNorm params) in FP32
+        )
+        print_rank0_info(
+            "Using FSDP MixedPrecision: param_dtype=fp16, reduce_dtype=fp32, buffer_dtype=fp32"
+        )
+    else:
+        # Default policy for bf16 or fp32
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=amp_dtype, reduce_dtype=amp_dtype, buffer_dtype=amp_dtype
+        )
     model = FSDP(
         model,
         device_id=device,
