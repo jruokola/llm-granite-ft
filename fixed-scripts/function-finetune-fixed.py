@@ -129,19 +129,23 @@ tok = AutoTokenizer.from_pretrained(
     args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
 )
 
+scaler = None
 if args.disable_amp:
     amp_dtype = torch.float32
-    scaler = None
     log.info("AMP disabled. Training in FP32.")
 else:
-    # User changed from bfloat16 to float16 due to previous GradScaler issues.
-    # When FSDP's param_dtype is torch.float16 (derived from amp_dtype here),
-    # GradScaler is generally not used/needed as FSDP handles FP16 parameters.
+    # Default to float16 for AMP if bfloat16 causes issues with GradScaler or specific kernels
+    # As per FSDP docs, GradScaler is not typically used when FSDP param_dtype is float16.
     amp_dtype = torch.float16
-    scaler = None  # Disable GradScaler
     log.info(
-        f"AMP enabled with {amp_dtype}. GradScaler is disabled; FSDP with FP16 params assumed."
+        f"AMP enabled with {amp_dtype}. GradScaler is disabled as FSDP handles FP16 params."
     )
+    # If BFloat16 + GradScaler were to be attempted again, it would be:
+    # from torch.amp import GradScaler # Import would be needed
+    # amp_dtype = torch.bfloat16
+    # scaler = GradScaler()
+    # log.info(f"AMP enabled with {amp_dtype} and GradScaler.")
+
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=args.use_qlora,
@@ -407,14 +411,22 @@ for ep in range(args.num_epochs):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.autocast("cuda", amp_dtype) if scaler else nullcontext(), fp8_ctx():
             loss = model(**batch).loss / args.gradient_accumulation_steps
-        (scaler.scale(loss) if scaler else loss).backward()
+
+        if scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if step % args.gradient_accumulation_steps == 0:
             if scaler:
                 scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt) if scaler else opt.step()
-            scaler.update() if scaler else None
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
             opt.zero_grad()
             sched.step()
             gstep += 1
