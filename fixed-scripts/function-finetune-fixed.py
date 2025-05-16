@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import subprocess
+import sys
 from collections import Counter
 from contextlib import nullcontext
 
@@ -87,6 +88,19 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("finetune")
+
+# Check for lora_r compatibility with FP8 if QLoRA and FP8 are enabled
+if args.use_fp8 and TE_OK and args.use_qlora and (args.lora_r % 16 != 0):
+    error_msg = (
+        f"FP8 execution with QLoRA requires --lora_r to be a multiple of 16. "
+        f"Current --lora_r is {args.lora_r}. Please adjust --lora_r (e.g., to 16, 32, etc.)."
+    )
+    log.error(error_msg)  # Log the error
+    # Rank 0 is typically responsible for user-facing messages.
+    if int(os.getenv("RANK", 0)) == 0:
+        print(f"CRITICAL ERROR: {error_msg}", file=sys.stderr)
+    # Exit all processes. This check is before dist.init_process_group(), so direct exit is fine.
+    sys.exit(1)
 
 dist.init_process_group("nccl")
 rank, local_rank = int(os.getenv("RANK", 0)), int(os.getenv("LOCAL_RANK", 0))
