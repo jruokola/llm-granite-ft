@@ -9,8 +9,8 @@
 #SBATCH --output=/root/slurm_logs/fc_%j.log
 #SBATCH --export=ALL             # propagate env to Pyxis
 
-############################ 0. constants & job paths #########################
-IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-31:latest"
+############################ 0. constants & job paths ######################### 
+IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-38:latest" # 38 QLora+FSDP+AMP works
 JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord"
 HOST_JOBDIR="/mnt/jail/${JOB_DIR}"
@@ -30,28 +30,28 @@ echo "IMAGE  ${IMAGE}"
 echo "CONTAINER_MOUNTS ${CONTAINER_MOUNTS}"
 
 ############################ 2. environment ###################################
-export WORLD_SIZE=${SLURM_NNODES}
 export RANK=${SLURM_PROCID}
 export LOCAL_RANK=${SLURM_LOCALID}
-export NCCL_DEBUG=WARN
+export WORLD_SIZE=${SLURM_NTASKS}
+export NCCL_DEBUG=INFO
 export PYXIS_VERBOSE=3
 export TORCH_DISTRIBUTED_TIMEOUT=1800
 export HF_DATASETS_CACHE=${CONT_JOB_DIR}/hf_cache
 export TOKENIZERS_PARALLELISM=false
 export FLASH_ATTENTION_FORCE_CUDA=1
-export PYTHONUNBUFFERED=1 # Force unbuffered Python output
+export PYTHONBUFFERED=1
 
 ############################ 3. python CLI ####################################
 FINETUNE_ARGS="--output_dir=${CONT_JOBDIR}/checkpoints \
   --processed_dataset_path=${CONT_DATADIR} \
-  --use_qlora \
-  --use_fp8 \
-  --batch_size_per_device=4"
+  --batch_size_per_device=16 \
+  --learning_rate=6e-5 \
+  --use_qlora"
 
 TORCHRUN_CMD="\
 torchrun \
     --nnodes=${SLURM_NNODES} \
-    --max-restarts=1 \
+    --max-restarts=0 \
     --nproc-per-node=1 \
     --rdzv-id=${SLURM_JOB_ID} \
     --rdzv-backend="c10d" \
@@ -61,7 +61,7 @@ torchrun \
 ############################ 4. launch containers #############################
 ## ─── Launch with srun + env:// init ──────────────────────────────────────────
 srun \
-     --export=ALL,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,NCCL_DEBUG,PYTHONUNBUFFERED,WORLD_SIZE,LOCAL_RANK,RANK \
+     --export=ALL,PYTHONBUFFERED,MASTER_IP,MASTER_PORT,PYXIS_VERBOSE,TORCH_DISTRIBUTED_TIMEOUT,HF_DATASETS_CACHE,TOKENIZERS_PARALLELISM,FLASH_ATTENTION_FORCE_CUDA,WORLD_SIZE,LOCAL_RANK,RANK \
      --container-image=${IMAGE} \
      --container-mounts=${CONTAINER_MOUNTS} \
      --container-workdir="/workspace" \
@@ -70,3 +70,4 @@ srun \
 EXIT_CODE=$?
 echo "Job finished with exit code ${EXIT_CODE}"
 exit ${EXIT_CODE}
+
