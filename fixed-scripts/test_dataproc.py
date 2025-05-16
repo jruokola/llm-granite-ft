@@ -1,291 +1,304 @@
 import argparse
-import logging
+import json  # For parsing JSON strings
 import os
+import sys  # For sys.stderr, sys.stdout
 import time
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+# Using print for now as per user request for better visibility in Slurm
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# --- Helper function to reconstruct text similar to FunctionCallingDataset ---
-# This is a simplified version of the original class's methods for direct use in .map()
+# logging.basicConfig(
+#     level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s"
+# )
+# logger = logging.getLogger(__name__)
 
 
-def _safe_process_message_for_map(message_item):
-    """Processes a single message item (dict, str, list) for map function."""
-    if isinstance(message_item, dict):
-        role = str(message_item.get("role", "")).lower()
-        content = str(message_item.get("content", ""))
-        if role == "system":
-            return f"<|system|>\n{content}\n"
-        elif role == "user":
-            return f"<|user|>\n{content}\n"
-        elif role == "assistant":
-            return f"<|assistant|>\n{content}\n"
-        else:
-            return f"<|user|>\n{content}\n"  # Default to user
-    elif isinstance(message_item, str):
-        return f"<|user|>\n{message_item}\n"
-    elif isinstance(message_item, list):
-        result = ""
-        for sub_message in message_item:
-            result += _safe_process_message_for_map(sub_message)
-        return result
-    return f"<|user|>\n{str(message_item)}\n"
+def print_rank0(*args, **kwargs):
+    if int(os.getenv("RANK", "0")) == 0:
+        print(*args, **kwargs)
+        sys.stdout.flush()
 
 
-def _flush_content_for_map(
-    current_role,
-    current_content_list,
-    formatted_text,
-    next_role=None,
-    next_content_line=None,
-    force_flush=False,
-):
-    if current_role and current_content_list:
-        role_content = "\n".join(current_content_list).strip()
-        if role_content:
-            if current_role == "system":
-                if not formatted_text.startswith("<|system|>"):  # Basic check
-                    formatted_text += f"<|system|>\n{role_content}\n"
-            elif current_role == "user":
-                formatted_text += f"<|user|>\n{role_content}\n"
-            elif current_role == "assistant":
-                formatted_text += f"<|assistant|>\n{role_content}\n"
-
-    if force_flush:
-        return None, [], formatted_text
-
-    new_role = next_role
-    new_content_list = [next_content_line.strip()] if next_content_line else []
-    return new_role, new_content_list, formatted_text
+def eprint_rank0(*args, **kwargs):
+    if int(os.getenv("RANK", "0")) == 0:
+        print(*args, file=sys.stderr, **kwargs)
+        sys.stderr.flush()
 
 
-def _create_labels(input_ids_list, tokenizer):
+# --- Granite Specific Tokens ---
+# These should ideally be actual tokens known by the tokenizer.
+# If not, the tokenizer might split them, making label creation harder.
+# For formatting text, we use them as strings.
+SOT = "<|start_of_role|>"
+EOTR = "<|end_of_role|>"
+EOTXT = "<|end_of_text|>"
+TOOL_CALL = "<|tool_call|>"  # Granite uses this specific token for tool calls
+
+# Roles for Granite
+ROLE_SYSTEM = "system"
+ROLE_AVAILABLE_TOOLS = "available_tools"
+ROLE_USER = "user"
+ROLE_ASSISTANT = "assistant"
+ROLE_TOOL_RESPONSE = "tool_response"
+
+
+def format_turn(role, content):
+    return f"{SOT}{role}{EOTR}{content}{EOTXT}\n"
+
+
+def _create_labels_granite(input_ids_list, tokenizer):
     """
-    Creates labels for language modeling, masking non-assistant parts.
-    input_ids_list: A list of token IDs.
-    tokenizer: The tokenizer instance.
+    Creates labels for language modeling, masking non-assistant parts for Granite format.
+    Only content after <|start_of_role|>assistant<|end_of_role|> and inside <|tool_call|> should be unmasked.
+    Tool responses and other roles are masked.
     """
-    labels = list(input_ids_list)  # Make a mutable copy
+    labels = [-100] * len(input_ids_list)  # Mask everything by default
 
-    # Attempt to find assistant markers robustly
-    # This is tricky because special tokens can be tokenized into multiple IDs or be part of vocab
-    # The original script's method of decoding pairs is heuristic.
-    # A truly robust method would involve finding the exact token ID sequence for "<|assistant|>" etc.
-    # For now, we stick to a similar heuristic as the fine-tuning script for consistency.
+    # Token IDs for key markers - this is crucial and assumes these are single tokens.
+    # If they are multi-token, this logic becomes much more complex.
+    # This part is highly dependent on the actual tokenizer being used with the Granite model.
+    # We'd need to check if these special tokens are added and get their IDs.
+    # For this example, we'll proceed with a string-matching heuristic on decoded segments,
+    # which is fragile but a common starting point if exact token IDs are unknown or complex.
 
-    assistant_marker_str = "<|assistant|>"
-    user_marker_str = "<|user|>"
-    system_marker_str = "<|system|>"
+    # Heuristic: Decode segments and look for role markers.
+    # This is very difficult to do robustly without knowing how the tokenizer handles these custom tokens.
+    # A better approach would be to tokenize markers separately and search for sub-sequences of token IDs.
 
-    assistant_positions = []
+    # For simplicity in this refactor, let's assume a simplified labeling:
+    # We want to predict what the assistant says, including its tool calls.
+    # This means unmasking tokens that are part of the assistant's response *after* its role marker,
+    # and the content of <|tool_call|> blocks.
 
-    # This simplified search might miss markers if they are split by the tokenizer in a way
-    # that `decode` on small windows doesn't reconstruct them.
-    # The original fine-tuning script decodes slices of 2 tokens.
-    # Let's try to emulate that, but be aware of its limitations.
-    for i in range(len(input_ids_list) - 1):  # Iterate up to the second to last token
-        # Decode a small window of tokens.
-        # Using skip_special_tokens=False to ensure markers are decoded if they are special.
-        # However, if they are not registered special tokens, this flag has no effect on them.
-        try:
-            # It's important that tokenizer.decode can handle arbitrary slices.
-            # Some tokenizers might expect complete sequences or valid UTF-8.
-            decoded_slice = tokenizer.decode(
-                input_ids_list[i : i + 2], skip_special_tokens=False
+    # This is a placeholder for a more robust labeling strategy.
+    # The core challenge is identifying the *exact token spans* for assistant responses.
+    # A simple heuristic: find "<|start_of_role|>assistant<|end_of_role|>" and unmask until "<|end_of_text|>".
+    # And find "<|tool_call|>" and unmask its JSON content.
+
+    # Due to the complexity and tokenizer-dependency, this simplified version will likely
+    # need significant refinement. For now, it will be very basic.
+
+    # Let's try to find assistant turns and tool_call sections by decoding.
+    # This is inefficient and approximate.
+    decoded_full_text = tokenizer.decode(input_ids_list, skip_special_tokens=False)
+
+    assistant_turn_start_marker = f"{SOT}{ROLE_ASSISTANT}{EOTR}"
+    tool_call_marker = TOOL_CALL
+    end_of_text_marker = EOTXT
+
+    current_idx = 0
+    while current_idx < len(decoded_full_text):
+        # Check for assistant turn
+        assistant_start_idx = decoded_full_text.find(
+            assistant_turn_start_marker, current_idx
+        )
+        if assistant_start_idx != -1:
+            # Found an assistant turn. Unmask from after the marker to EOTXT or next SOT.
+            content_start_char_idx = assistant_start_idx + len(
+                assistant_turn_start_marker
             )
-        except:  # Broad except as tokenizer internals can vary
-            decoded_slice = ""
 
-        if assistant_marker_str in decoded_slice:
-            # This position 'i' is where the assistant marker *starts* or is detected within this window.
-            assistant_positions.append(i)
+            # Check if this assistant turn is a tool call
+            tool_call_start_idx = decoded_full_text.find(
+                tool_call_marker, content_start_char_idx
+            )
+            eotxt_after_assistant_marker = decoded_full_text.find(
+                end_of_text_marker, content_start_char_idx
+            )
 
-    if assistant_positions:
-        in_assistant_segment = False
-        # Mask tokens up to the first assistant token, and the assistant token itself.
-        # Then, unmask tokens until a new user/system token or end of sequence.
+            if tool_call_start_idx != -1 and (
+                eotxt_after_assistant_marker == -1
+                or tool_call_start_idx < eotxt_after_assistant_marker
+            ):
+                # This is a tool call. Unmask from TOOL_CALL to its corresponding EOTXT
+                # The content of TOOL_CALL is JSON, which itself might contain EOTXT if not careful.
+                # Assuming tool call JSON does not contain EOTXT literally.
+                actual_tool_call_content_start_char_idx = tool_call_start_idx + len(
+                    tool_call_marker
+                )
 
-        # More direct approach: iterate tokens, switch state, mask accordingly.
-        current_pos = 0
-        while current_pos < len(labels):
-            is_assistant_start = False
-            # Check if current_pos is one of the identified assistant_positions
-            # This check needs to be robust to multi-token markers.
-            # The original logic was: if i in assistant_positions: labels[i:i+2] = -100
-            # This implies the marker is roughly 2 tokens.
+                # Find the end of the tool call block, which is before the main EOTXT of the assistant turn
+                # This is tricky. The Granite example shows: <|assistant|><|end_of_role|><|tool_call|>[...]EOTXT
+                # So, the EOTXT for the tool_call *is* the EOTXT for the assistant turn.
 
-            # Let's try to find the *actual* assistant marker tokens and mask them.
-            # This is still heuristic without knowing the exact token IDs of markers.
+                end_of_tool_call_char_idx = decoded_full_text.find(
+                    end_of_text_marker, actual_tool_call_content_start_char_idx
+                )
+                if end_of_tool_call_char_idx != -1:
+                    # Convert character indices to token indices (approximate)
+                    # This is where it gets very heuristic without precise token mapping.
+                    # For each character, find which token it belongs to.
+                    # This is a rough approximation.
+                    start_token_idx = -1
+                    end_token_idx = -1
 
-            # Simplified logic based on the original script's intent:
-            # Mask everything that is not explicitly part of an assistant's response.
-
-            temp_in_assistant = False
-            for i in range(len(labels)):
-                # Try to detect start of assistant turn
-                if i in assistant_positions:  # Heuristic: marker starts at i
-                    temp_in_assistant = True
-                    # Mask the marker itself (assuming 2 tokens for simplicity like original)
-                    labels[i] = -100
-                    if i + 1 < len(labels):
-                        labels[i + 1] = -100
-                    continue  # Move to token after marker
-
-                if not temp_in_assistant:
-                    labels[i] = -100
-                else:  # We are in an assistant turn
-                    # Check for end of assistant turn (start of user/system)
-                    # This also needs robust detection of user/system markers
-                    is_user_or_system_marker = False
-                    if i + 1 < len(labels):
-                        try:
-                            decoded_slice_end = tokenizer.decode(
-                                input_ids_list[i : i + 2], skip_special_tokens=False
-                            )
-                        except:
-                            decoded_slice_end = ""
+                    # Find start_token_idx for actual_tool_call_content_start_char_idx
+                    cumulative_len = 0
+                    for i, token_id in enumerate(input_ids_list):
+                        token_str = tokenizer.decode(
+                            [token_id], skip_special_tokens=False
+                        )
                         if (
-                            user_marker_str in decoded_slice_end
-                            or system_marker_str in decoded_slice_end
+                            cumulative_len >= actual_tool_call_content_start_char_idx
+                            and start_token_idx == -1
                         ):
-                            is_user_or_system_marker = True
+                            start_token_idx = i
+                        cumulative_len += len(token_str)
+                        if (
+                            cumulative_len >= end_of_tool_call_char_idx
+                            and start_token_idx != -1
+                        ):
+                            end_token_idx = (
+                                i  # Unmask up to the token containing the end
+                            )
+                            break
 
-                    if is_user_or_system_marker:
-                        temp_in_assistant = False
-                        labels[i] = -100  # Mask the user/system marker
-                        if i + 1 < len(labels):
-                            labels[i + 1] = -100
-            break  # Broke out of the while current_pos loop, used temp_in_assistant logic instead
+                    if start_token_idx != -1 and end_token_idx != -1:
+                        for i in range(
+                            start_token_idx, end_token_idx + 1
+                        ):  # Inclusive of the end token
+                            if i < len(labels):
+                                labels[i] = input_ids_list[i]
 
-    else:  # No assistant token found
-        for i in range(len(labels)):
-            labels[i] = -100
+                    current_idx = end_of_tool_call_char_idx + len(end_of_text_marker)
+                    continue  # Move to after this assistant turn
+
+            elif eotxt_after_assistant_marker != -1:  # Regular assistant text response
+                # Unmask from after assistant marker to EOTXT
+                cumulative_len = 0
+                start_token_idx = -1
+                end_token_idx = -1
+                for i, token_id in enumerate(input_ids_list):
+                    token_str = tokenizer.decode([token_id], skip_special_tokens=False)
+                    if (
+                        cumulative_len >= content_start_char_idx
+                        and start_token_idx == -1
+                    ):
+                        start_token_idx = i
+                    cumulative_len += len(token_str)
+                    if (
+                        cumulative_len >= eotxt_after_assistant_marker
+                        and start_token_idx != -1
+                    ):
+                        end_token_idx = i
+                        break
+
+                if start_token_idx != -1 and end_token_idx != -1:
+                    for i in range(start_token_idx, end_token_idx + 1):
+                        if i < len(labels):
+                            labels[i] = input_ids_list[i]
+                current_idx = eotxt_after_assistant_marker + len(end_of_text_marker)
+                continue
+
+        # If no assistant turn found, or past the last one, break
+        break
+
+    # Mask all special tokens used for formatting, regardless of whose turn it is.
+    # This is also heuristic. A better way is to get their actual token IDs.
+    special_tokens_to_mask = [
+        SOT,
+        EOTR,
+        EOTXT,
+        TOOL_CALL,
+        ROLE_SYSTEM,
+        ROLE_AVAILABLE_TOOLS,
+        ROLE_USER,
+        ROLE_ASSISTANT,
+        ROLE_TOOL_RESPONSE,
+    ]
+    # Add role names themselves if they might appear outside markers
+    # and are tokenized into something non-standard.
+
+    # This masking of special tokens is very basic and might over-mask or under-mask.
+    # It's generally better to rely on the unmasking of desired content only.
+    # The default of -100 for all labels already handles masking non-assistant parts.
+    # The main task is to *unmask* the correct assistant parts.
 
     return labels
 
 
 def preprocess_example(example, tokenizer, max_length):
-    """
-    Processes a single raw example from the dataset into tokenized form
-    with input_ids, attention_mask, and labels.
-    """
-    idx = example.get("_idx_internal", None)  # If we add an index during enumeration
-
     formatted_text = ""
-    # System message
-    if "system" in example and example["system"] is not None:
+
+    # 1. System Prompt
+    if example.get("system"):
         system_content = str(example["system"]).strip()
         if system_content:
-            formatted_text += f"<|system|>\n{system_content}\n"
+            formatted_text += format_turn(ROLE_SYSTEM, system_content)
 
-    # Chat content
-    chat_content = example.get("chat", example.get("text", str(example)))
+    # 2. Available Tools
+    if example.get("tools"):
+        tools_json_str = example[
+            "tools"
+        ]  # This is already a JSON string in hqfx/glaive_fc_v2
+        # Validate if it's proper JSON, though the dataset should provide it.
+        # For Granite, the content is the JSON list itself.
+        formatted_text += format_turn(ROLE_AVAILABLE_TOOLS, tools_json_str)
 
-    if isinstance(chat_content, str):
-        lines = chat_content.split("\n")
-        current_role = None
-        current_content_list = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+    # 3. Chat History
+    chat_history = example.get("chat", [])
+    if not isinstance(chat_history, list):  # Handle cases where chat might be a string
+        chat_history = [{"role": "user", "content": str(chat_history)}]
 
-            new_role_detected = False
-            if line.startswith("SYSTEM:"):
-                current_role, current_content_list, formatted_text = (
-                    _flush_content_for_map(
-                        current_role,
-                        current_content_list,
-                        formatted_text,
-                        "system",
-                        line.replace("SYSTEM:", "").strip(),
-                    )
-                )
-                new_role_detected = True
-            elif line.startswith("USER:"):
-                current_role, current_content_list, formatted_text = (
-                    _flush_content_for_map(
-                        current_role,
-                        current_content_list,
-                        formatted_text,
-                        "user",
-                        line.replace("USER:", "").strip(),
-                    )
-                )
-                new_role_detected = True
-            elif line.startswith("A:"):  # Assuming 'A:' is Assistant
-                current_role, current_content_list, formatted_text = (
-                    _flush_content_for_map(
-                        current_role,
-                        current_content_list,
-                        formatted_text,
-                        "assistant",
-                        line.replace("A:", "").strip(),
-                    )
-                )
-                new_role_detected = True
-            elif line.startswith("FUNCTION RESPONSE:"):
-                if current_role == "assistant":
-                    current_content_list.append(line)
-                else:
-                    current_role, current_content_list, formatted_text = (
-                        _flush_content_for_map(
-                            current_role,
-                            current_content_list,
-                            formatted_text,
-                            "assistant",
-                            line,
-                        )
-                    )
-                new_role_detected = True  # Treat as boundary
+    for turn in chat_history:
+        role = turn.get("role", "").lower()
+        content = turn.get("content")
+        function_call = turn.get("function_call")  # For assistant
 
-            if not new_role_detected:
-                if current_role:
-                    current_content_list.append(line)
-                else:  # Default if no role seen yet
-                    current_role = "system"
-                    current_content_list = [line]
+        if role == "user":
+            formatted_text += format_turn(
+                ROLE_USER, str(content).strip() if content else ""
+            )
+        elif role == "assistant":
+            assistant_response = ""
+            if function_call:
+                # Ensure arguments are properly stringified JSON if they are dicts
+                if isinstance(function_call.get("arguments"), dict):
+                    function_call["arguments"] = json.dumps(function_call["arguments"])
+                # Granite format: <|tool_call|>[{"name": "...", "arguments": "{...}"}]
+                # The raw data `function_call` is a dict, needs to be a list of one dict for Granite.
+                assistant_response += f"{TOOL_CALL}[{json.dumps(function_call)}]"
+            elif content:
+                assistant_response += str(content).strip()
+            else:  # Assistant turn must have content or tool_call
+                assistant_response = ""  # Or some placeholder if necessary
+            formatted_text += format_turn(ROLE_ASSISTANT, assistant_response)
+        elif (
+            role == "tool_output" or role == "tool_response"
+        ):  # Glaive uses tool_output
+            # Content is expected to be a JSON string from the dataset
+            tool_output_content = str(content).strip() if content else "{}"
+            formatted_text += format_turn(ROLE_TOOL_RESPONSE, tool_output_content)
+        # Ignoring 'tool_code' from glaive as Granite format doesn't have a direct equivalent,
+        # it's represented by assistant's tool_call.
 
-        # Flush any remaining content
-        _, _, formatted_text = _flush_content_for_map(
-            current_role, current_content_list, formatted_text, force_flush=True
-        )
-
-    elif isinstance(chat_content, list):
-        for message_item in chat_content:
-            formatted_text += _safe_process_message_for_map(message_item)
-    else:
-        formatted_text += f"<|user|>\n{str(chat_content)}\n"
-
-    formatted_text = formatted_text.replace("<|endoftext|>", "")
+    # Fallback for empty formatted text
     if not formatted_text.strip():
-        formatted_text = (
-            "<|user|>\nHello\n<|assistant|>\nHello! How can I help you today?\n"
+        print_rank0(
+            f"[WARNING] Example resulted in empty formatted text. Using fallback. Original: {example}"
+        )
+        formatted_text = format_turn(ROLE_USER, "Hello") + format_turn(
+            ROLE_ASSISTANT, "Hello! How can I help you today?"
         )
 
-    # Tokenize
-    # Ensure pad_token is set on the tokenizer instance passed to this function
-    # tokenizer.pad_token = tokenizer.eos_token (should be done outside, once)
+    # Tokenization
+    # Ensure tokenizer has pad_token set (usually to eos_token)
+    # This should be done once outside this map function.
+    # if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+
     encodings = tokenizer(
         formatted_text,
         max_length=max_length,
         truncation=True,
-        padding="max_length",  # Pad to max_length for consistent tensor shapes
+        padding="max_length",
         return_attention_mask=True,
     )
 
     input_ids = encodings["input_ids"]
     attention_mask = encodings["attention_mask"]
-
-    # Create labels
-    labels = _create_labels(input_ids, tokenizer)
+    labels = _create_labels_granite(input_ids, tokenizer)
 
     return {
         "input_ids": input_ids,
@@ -296,26 +309,28 @@ def preprocess_example(example, tokenizer, max_length):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Preprocess FunctionCallingDataset and save to disk."
+        description="Preprocess FunctionCallingDataset for Granite and save to disk."
     )
     parser.add_argument(
         "--model_name_or_path",
         type=str,
         default="ibm-granite/granite-3.3-2b-instruct",
-        help="Tokenizer model name or path.",
+        help="Tokenizer model name or path (for loading the tokenizer).",
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="glaiveai/glaive-function-calling-v2",
+        default="hqfx/glaive_fc_v2",  # Using the user-provided dataset
         help="Name of the dataset on Hugging Face Hub.",
     )
-    parser.add_argument(
-        "--dataset_data_file",
-        type=str,
-        default="glaive-function-calling-v2.json",  # Confirmed by user
-        help="Specific data file within the dataset (e.g., json, jsonl).",
-    )
+    # --dataset_data_file is not needed if dataset_name directly points to a config with one file.
+    # For hqfx/glaive_fc_v2, it seems to load directly.
+    # parser.add_argument(
+    #     "--dataset_data_file",
+    #     type=str,
+    #     default=None, # Let load_dataset pick default if None
+    #     help="Specific data file within the dataset (e.g., json, jsonl).",
+    # )
     parser.add_argument(
         "--output_path",
         type=str,
@@ -331,52 +346,77 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=2048,
+        default=2048,  # Default from original script, user might change this
         help="Maximum sequence length for tokenization.",
     )
     parser.add_argument(
         "--num_proc",
         type=int,
-        default=None,  # os.cpu_count(),
-        help="Number of processes to use for .map(). Defaults to all available CPUs.",
+        default=None,
+        help="Number of processes to use for .map(). Defaults to available CPUs.",
     )
     script_args = parser.parse_args()
 
     if script_args.num_proc is None:
         script_args.num_proc = os.cpu_count()
-        logger.info(f"Using {script_args.num_proc} processes for dataset mapping.")
+    print_rank0(f"Using {script_args.num_proc} processes for dataset mapping.")
 
-    logger.info(f"Loading tokenizer: {script_args.model_name_or_path}")
+    print_rank0(f"Loading tokenizer: {script_args.model_name_or_path}")
+    # It's crucial that this tokenizer knows the Granite special tokens.
+    # If not, they need to be added: tokenizer.add_special_tokens(...)
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_name_or_path, trust_remote_code=True
     )
     if tokenizer.pad_token is None:
+        # Common practice, but ensure EOS is appropriate for padding for this model
         tokenizer.pad_token = tokenizer.eos_token
-        logger.info(
+        print_rank0(
             f"Set tokenizer.pad_token to tokenizer.eos_token: {tokenizer.eos_token}"
         )
 
-    logger.info(f"Loading raw dataset: {script_args.dataset_name}")
+    # Verify if Granite special tokens are part of the vocabulary
+    # This is important for correct tokenization and label creation
+    granite_tokens = [
+        SOT,
+        EOTR,
+        EOTXT,
+        TOOL_CALL,
+        ROLE_SYSTEM,
+        ROLE_AVAILABLE_TOOLS,
+        ROLE_USER,
+        ROLE_ASSISTANT,
+        ROLE_TOOL_RESPONSE,
+    ]
+    # A simple check; a more robust check would involve tokenizer.convert_tokens_to_ids
+    # for token_str in granite_tokens:
+    #     if token_str not in tokenizer.vocab:
+    #         print_rank0(f"[WARNING] Special token '{token_str}' may not be in tokenizer vocabulary!")
+    # Consider adding them if they are not:
+    # num_added_toks = tokenizer.add_special_tokens({'additional_special_tokens': granite_tokens})
+    # if num_added_toks > 0:
+    #    print_rank0(f"Added {num_added_toks} special tokens to tokenizer.")
+    #    # model.resize_token_embeddings(len(tokenizer)) # If resizing model embeddings
+
+    print_rank0(f"Loading raw dataset: {script_args.dataset_name}")
     try:
-        # Load the specific data file for the 'train' split
         raw_dataset_dict = load_dataset(
-            script_args.dataset_name,
-            data_files={"train": script_args.dataset_data_file},
-        )
+            script_args.dataset_name
+        )  # Removed data_files for hqfx
+        # hqfx/glaive_fc_v2 has a 'train' split by default
         if "train" not in raw_dataset_dict:
-            logger.error(
-                f"'train' split not found in loaded dataset. Available splits: {list(raw_dataset_dict.keys())}"
+            eprint_rank0(
+                f"'train' split not found. Available: {list(raw_dataset_dict.keys())}"
             )
-            exit(1)
+            sys.exit(1)
         raw_dataset_train = raw_dataset_dict["train"]
     except Exception as e:
-        logger.error(f"Failed to load dataset: {e}")
+        eprint_rank0(f"Failed to load dataset: {e}")
         import traceback
 
-        traceback.print_exc()
-        exit(1)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
-    logger.info(f"Raw 'train' dataset loaded. Total examples: {len(raw_dataset_train)}")
+    print_rank0(f"Raw 'train' dataset loaded. Total examples: {len(raw_dataset_train)}")
 
     if (
         script_args.num_samples_to_process > 0
@@ -385,18 +425,14 @@ if __name__ == "__main__":
         raw_dataset_subset = raw_dataset_train.select(
             range(script_args.num_samples_to_process)
         )
-        logger.info(f"Processing a subset of {len(raw_dataset_subset)} samples.")
+        print_rank0(f"Processing a subset of {len(raw_dataset_subset)} samples.")
     else:
         raw_dataset_subset = raw_dataset_train
-        logger.info(
+        print_rank0(
             f"Processing all {len(raw_dataset_subset)} samples from 'train' split."
         )
 
-    # Prepare for mapping
-    # The `preprocess_example` function needs `tokenizer` and `max_length`.
-    # We can pass these using `fn_kwargs` in the `.map()` call.
-
-    logger.info(
+    print_rank0(
         f"Starting dataset preprocessing with {script_args.num_proc} processes..."
     )
     start_map_time = time.time()
@@ -405,19 +441,16 @@ if __name__ == "__main__":
         preprocess_example,
         fn_kwargs={"tokenizer": tokenizer, "max_length": script_args.max_seq_length},
         num_proc=script_args.num_proc,
-        remove_columns=raw_dataset_subset.column_names,  # Remove old columns to keep only processed ones
+        remove_columns=raw_dataset_subset.column_names,
+        desc="Preprocessing dataset for Granite format",
     )
 
     map_duration = time.time() - start_map_time
-    logger.info(f"Dataset preprocessing finished in {map_duration:.2f} seconds.")
+    print_rank0(f"Dataset preprocessing finished in {map_duration:.2f} seconds.")
 
-    # Set format to PyTorch tensors for easier loading in the training script
-    # processed_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    # Saving to disk in Arrow format is generally fine; set_format can be done after loading.
-
-    logger.info(f"Saving processed dataset to {script_args.output_path}...")
+    print_rank0(f"Saving processed dataset to {script_args.output_path}...")
     start_save_time = time.time()
     processed_dataset.save_to_disk(script_args.output_path)
     save_duration = time.time() - start_save_time
-    logger.info(f"Processed dataset saved in {save_duration:.2f} seconds.")
-    logger.info("--- Preprocessing Complete ---")
+    print_rank0(f"Processed dataset saved in {save_duration:.2f} seconds.")
+    print_rank0("--- Preprocessing Complete ---")
