@@ -33,6 +33,6 @@ ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
 # Provide a shell for interactive debugging
-CMD ["bash"]
+#CMD ["bash"]
 # Alternatively, to run the script directly (ensure it handles CPU execution):
-#CMD ["uv run python", "./function-finetune-osx.py"]
+CMD ["uv","run","python","./function-finetune-osx.py","--processed_dataset_path","./glaive_fc_v2"]
