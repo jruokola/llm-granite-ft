@@ -286,25 +286,33 @@ else:
 # Model loading (potentially on meta device for FSDP2)
 # For FSDP2, it's recommended to load on "meta" device first if not using QLoRA directly on GPU
 # However, QLoRA with BitsAndBytesConfig usually requires GPU for quantization.
-# This interaction needs care. For now, assume QLoRA loads on GPU as before.
-if args.use_qlora:
-    if amp_dtype == torch.bfloat16:
-        model_load_torch_dtype = torch.bfloat16
-    else:
-        model_load_torch_dtype = (
-            torch.float32
-        )  # For stability with QLoRA non-quant parts
-else:
-    model_load_torch_dtype = amp_dtype
 
-print_rank0_info(f"Loading model with torch_dtype: {model_load_torch_dtype}")
+# Determine model_load_torch_dtype for AutoModelForCausalLM.from_pretrained
+# This will also be used for bnb_4bit_quant_storage if QLoRA is active.
+model_load_torch_dtype = amp_dtype
+if args.use_qlora:
+    print_rank0_info(
+        f"QLoRA active: Model `torch_dtype` and `bnb_4bit_quant_storage` will be {model_load_torch_dtype}. "
+        f"QLoRA compute dtype (`bnb_4bit_compute_dtype`) will be {amp_dtype}."
+    )
+else:
+    print_rank0_info(
+        f"QLoRA not active: Loading model with `torch_dtype` {model_load_torch_dtype}."
+    )
+
+
+print_rank0_info(
+    f"Loading model with torch_dtype: {model_load_torch_dtype}"
+)  # This line is effectively duplicated by the QLoRA active/inactive log above, but kept for consistency if QLoRA is off.
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=args.use_qlora,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=amp_dtype,  # Compute dtype for BnB
+    bnb_4bit_compute_dtype=amp_dtype,  # Compute dtype for BnB operations
     bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_storage=torch.float16,  # Storage for 4-bit weights
+    bnb_4bit_quant_storage=model_load_torch_dtype
+    if args.use_qlora
+    else None,  # Storage dtype for 4-bit weights, must match model's float type for FSDP2
 )
 model = AutoModelForCausalLM.from_pretrained(
     args.model_name_or_path,
@@ -359,134 +367,132 @@ if rank == 0:
 # Convert model to FP8 using torchao if enabled
 if args.use_fp8_torchao and TORCHAO_OK:
     if args.use_qlora:
-        print_rank0_error(  # Changed to error as this combination is likely problematic and untested by torchao examples
-            "ERROR: --use_fp8_torchao with --use_qlora is a complex configuration. "
-            "QLoRA (bitsandbytes) already handles base model precision and compute dtype. "
-            "Applying torchao FP8 on top may lead to conflicts or unintended behavior. "
-            "Skipping torchao FP8 conversion. BitsAndBytes compute_dtype is: {amp_dtype}"
+        print_rank0_info(  # Changed from error to info/warning
+            "WARNING: --use_fp8_torchao with --use_qlora is an experimental configuration. "
+            "Applying torchao FP8 conversion to LoRA adapters on top of a QLoRA base model. "
+            "Ensure compatibility and monitor behavior closely. "
+            f"QLoRA compute_dtype is: {amp_dtype}, torchao FP8 will be applied to LoRA layers."
         )
-    else:
-        print_rank0_info(
-            "Applying torchao FP8 conversion to the model (non-QLoRA path)..."
-        )
-        try:
-            if not TORCH_VERSION_AT_LEAST_2_5:
-                print_rank0_error(
-                    "torchao.float8 training APIs require PyTorch version 2.5 or greater. Skipping FP8 conversion."
-                )
-                args.use_fp8_torchao = False
-                raise RuntimeError(
-                    "PyTorch version too old for torchao.float8 training."
-                )
-
-            def linear_layer_filter_fn(module, fqn):  # Signature: (module, fqn)
-                if isinstance(module, torch.nn.Linear):
-                    is_compatible = (
-                        module.in_features % 16 == 0 and module.out_features % 16 == 0
-                    )
-                    if not is_compatible:
-                        print_rank0_info(
-                            f"Skipping FP8 conversion for {fqn} (in_features={module.in_features}, out_features={module.out_features}) due to non-divisibility by 16."
-                        )
-                    return is_compatible
-                return False
-
-            print_rank0_info(
-                f"Attempting FP8 conversion using convert_to_float8_training with recipe: {args.float8_recipe_name}..."
-            )
-
-            try:
-                recipe_enum_key = args.float8_recipe_name.upper()
-                if (
-                    recipe_enum_key not in Float8Recipe.__members__
-                ):  # Check if key is valid for enum
-                    print_rank0_error(
-                        f"Invalid float8_recipe_name: {args.float8_recipe_name}. Defaulting to DYNAMIC."
-                    )
-                    recipe_enum = Float8Recipe.DYNAMIC
-                else:
-                    recipe_enum = Float8Recipe[recipe_enum_key]
-                config = Float8LinearConfig(recipe=recipe_enum)
-                print_rank0_info(
-                    f"Created Float8LinearConfig with recipe: {config.recipe}"
-                )
-            except KeyError:  # Fallback if string to enum mapping fails for some reason
-                print_rank0_error(
-                    f"Failed to map float8_recipe_name '{args.float8_recipe_name}' to Float8Recipe. Defaulting to DYNAMIC."
-                )
-                config = Float8LinearConfig(recipe=Float8Recipe.DYNAMIC)
-
-            # Apply FSDP-specific torchao settings using imported functions
-            # These apply if recipe is tensor-based (DYNAMIC or TENSOR)
-            if config.recipe in [Float8Recipe.DYNAMIC, Float8Recipe.TENSOR]:
-                if args.float8_enable_fsdp_all_gather:
-                    enable_fsdp_float8_all_gather(True)
-                    print_rank0_info(
-                        "torchao: Enabled FSDP float8 all_gather via function call."
-                    )
-                else:
-                    enable_fsdp_float8_all_gather(
-                        False
-                    )  # Explicitly set to default or user's choice
-                    print_rank0_info(
-                        "torchao: FSDP float8 all_gather set to False (or default) via function call."
-                    )
-
-                if args.float8_precompute_dynamic_scale:
-                    precompute_float8_dynamic_scale_for_fsdp(True)
-                    print_rank0_info(
-                        "torchao: Enabled FSDP precompute_float8_dynamic_scale via function call."
-                    )
-                else:
-                    precompute_float8_dynamic_scale_for_fsdp(False)
-                    print_rank0_info(
-                        "torchao: FSDP precompute_float8_dynamic_scale set to False (or default) via function call."
-                    )
-
-                if args.float8_force_recompute_weight_bwd:
-                    force_recompute_fp8_weight_in_bwd(True)
-                    print_rank0_info(
-                        "torchao: Enabled FSDP force_recompute_fp8_weight_in_bwd via function call."
-                    )
-                else:
-                    force_recompute_fp8_weight_in_bwd(False)
-                    print_rank0_info(
-                        "torchao: FSDP force_recompute_fp8_weight_in_bwd set to False (or default) via function call."
-                    )
-            else:  # rowwise or other recipes
-                if (
-                    args.float8_enable_fsdp_all_gather
-                    or args.float8_precompute_dynamic_scale
-                    or args.float8_force_recompute_weight_bwd
-                ):
-                    print_rank0_info(
-                        f"FSDP-specific FP8 flags are not applicable for recipe '{config.recipe}' and are ignored."
-                    )
-
-            model = convert_to_float8_training(
-                model, module_filter_fn=linear_layer_filter_fn, linear_config=config
-            )
-            print_rank0_info(
-                f"Model conversion using torchao.float8.convert_to_float8_training (recipe: {config.recipe}) completed."
-            )
-            print_rank0_info(
-                f"Dtype histogram after torchao FP8 (training API) conversion: {Counter(p.dtype for p in model.parameters())}"
-            )
-
-        except RuntimeError as e:
-            if "PyTorch version too old" in str(e):
-                # args.use_fp8_torchao is already set to False
-                pass
-            else:
-                print_rank0_error(
-                    f"torchao FP8 conversion or config failed: {e}. Proceeding without torchao FP8 features."
-                )
-                args.use_fp8_torchao = False
-        except Exception as e:
+    # Proceed with conversion regardless of QLoRA status if use_fp8_torchao is True
+    print_rank0_info(
+        "Applying torchao FP8 conversion to compatible Linear layers (e.g., LoRA adapters if present)..."
+    )
+    try:
+        if not TORCH_VERSION_AT_LEAST_2_5:
             print_rank0_error(
-                f"torchao FP8 conversion or config failed: {e}. Proceeding without torchao FP8 features."
+                "torchao.float8 training APIs require PyTorch version 2.5 or greater. Skipping FP8 conversion."
             )
-            args.use_fp8_torchao = False  # Fallback to non-FP8 path
+            args.use_fp8_torchao = False  # Corrected indentation
+            raise RuntimeError(
+                "PyTorch version too old for torchao.float8 training."
+            )  # Corrected indentation
+
+        def linear_layer_filter_fn(module, fqn):  # Signature: (module, fqn)
+            if isinstance(module, torch.nn.Linear):
+                is_compatible = (
+                    module.in_features % 16 == 0 and module.out_features % 16 == 0
+                )
+                if not is_compatible:
+                    print_rank0_info(
+                        f"Skipping FP8 conversion for {fqn} (in_features={module.in_features}, out_features={module.out_features}) due to non-divisibility by 16."
+                    )
+                return is_compatible
+            return False
+
+        print_rank0_info(
+            f"Attempting FP8 conversion using convert_to_float8_training with recipe: {args.float8_recipe_name}..."
+        )
+
+        try:
+            recipe_enum_key = args.float8_recipe_name.upper()
+            if (
+                recipe_enum_key not in Float8Recipe.__members__
+            ):  # Check if key is valid for enum
+                print_rank0_error(
+                    f"Invalid float8_recipe_name: {args.float8_recipe_name}. Defaulting to DYNAMIC."
+                )
+                recipe_enum = Float8Recipe.DYNAMIC
+            else:
+                recipe_enum = Float8Recipe[recipe_enum_key]
+            config = Float8LinearConfig(recipe=recipe_enum)
+            print_rank0_info(f"Created Float8LinearConfig with recipe: {config.recipe}")
+        except KeyError:  # Fallback if string to enum mapping fails for some reason
+            print_rank0_error(
+                f"Failed to map float8_recipe_name '{args.float8_recipe_name}' to Float8Recipe. Defaulting to DYNAMIC."
+            )
+            config = Float8LinearConfig(recipe=Float8Recipe.DYNAMIC)
+
+        # Apply FSDP-specific torchao settings using imported functions
+        # These apply if recipe is tensor-based (DYNAMIC or TENSOR)
+        if config.recipe in [Float8Recipe.DYNAMIC, Float8Recipe.TENSOR]:
+            if args.float8_enable_fsdp_all_gather:
+                enable_fsdp_float8_all_gather(True)
+                print_rank0_info(
+                    "torchao: Enabled FSDP float8 all_gather via function call."
+                )
+            else:
+                enable_fsdp_float8_all_gather(
+                    False
+                )  # Explicitly set to default or user's choice
+                print_rank0_info(
+                    "torchao: FSDP float8 all_gather set to False (or default) via function call."
+                )
+
+            if args.float8_precompute_dynamic_scale:
+                precompute_float8_dynamic_scale_for_fsdp(True)
+                print_rank0_info(
+                    "torchao: Enabled FSDP precompute_float8_dynamic_scale via function call."
+                )
+            else:
+                precompute_float8_dynamic_scale_for_fsdp(False)
+                print_rank0_info(
+                    "torchao: FSDP precompute_float8_dynamic_scale set to False (or default) via function call."
+                )
+
+            if args.float8_force_recompute_weight_bwd:
+                force_recompute_fp8_weight_in_bwd(True)
+                print_rank0_info(
+                    "torchao: Enabled FSDP force_recompute_fp8_weight_in_bwd via function call."
+                )
+            else:
+                force_recompute_fp8_weight_in_bwd(False)
+                print_rank0_info(
+                    "torchao: FSDP force_recompute_fp8_weight_in_bwd set to False (or default) via function call."
+                )
+        else:  # rowwise or other recipes
+            if (
+                args.float8_enable_fsdp_all_gather
+                or args.float8_precompute_dynamic_scale
+                or args.float8_force_recompute_weight_bwd
+            ):
+                print_rank0_info(
+                    f"FSDP-specific FP8 flags are not applicable for recipe '{config.recipe}' and are ignored."
+                )
+
+        model = convert_to_float8_training(
+            model, module_filter_fn=linear_layer_filter_fn, linear_config=config
+        )
+        print_rank0_info(
+            f"Model conversion using torchao.float8.convert_to_float8_training (recipe: {config.recipe}) completed."
+        )
+        print_rank0_info(
+            f"Dtype histogram after torchao FP8 (training API) conversion: {Counter(p.dtype for p in model.parameters())}"
+        )
+    # Restored except blocks
+    except RuntimeError as e:
+        if "PyTorch version too old" in str(e):
+            # args.use_fp8_torchao was already set to False before raising.
+            pass
+        else:
+            print_rank0_error(
+                f"torchao FP8 conversion or config failed (RuntimeError): {e}. Proceeding without torchao FP8 features."
+            )
+            args.use_fp8_torchao = False
+    except Exception as e:
+        print_rank0_error(
+            f"torchao FP8 conversion or config failed (Exception): {e}. Proceeding without torchao FP8 features."
+        )
+        args.use_fp8_torchao = False  # Fallback to non-FP8 path
 
 # FSDP ignored parameters for QLoRA
 # For FSDP2, we need to provide a list of parameters to ignore, not modules.

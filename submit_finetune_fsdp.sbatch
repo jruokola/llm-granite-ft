@@ -10,7 +10,7 @@
 #SBATCH --export=ALL             # propagate env to Pyxis
 
 ############################ 0. constants & job paths ######################### 
-IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-38:latest" # 38 QLora+FSDP+AMP and QLora+DDP+AMP (-no-fsdp flag) works
+IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-39:latest" # 38 QLora+DDP+AMP works
 JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord"
 HOST_JOBDIR="/mnt/jail/${JOB_DIR}"
@@ -54,7 +54,7 @@ torchrun \
     --max-restarts=0 \
     --nproc-per-node=1 \
     --rdzv-id=${SLURM_JOB_ID} \
-    --rdzv-backend=c10d \
+    --rdzv-backend="c10d" \
     --rdzv-endpoint="worker-0.soperator-worker-svc.soperator.svc.cluster.local:${MASTER_PORT}" \
     function-finetune-fixed.py ${FINETUNE_ARGS}"
 

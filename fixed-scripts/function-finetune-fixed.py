@@ -229,27 +229,26 @@ else:  # AMP enabled, FP8 not used
         )
 
 # Determine model_load_torch_dtype for AutoModelForCausalLM.from_pretrained
+# This will also be used for bnb_4bit_quant_storage if QLoRA is active.
+model_load_torch_dtype = amp_dtype
 if args.use_qlora:
-    if amp_dtype == torch.bfloat16:  # If amp_dtype ended up as bfloat16
-        model_load_torch_dtype = torch.bfloat16
-        print_rank0_info(
-            "QLoRA active: Loading base model in torch.bfloat16 for non-quantized parts."
-        )
-    else:  # amp_dtype is float16 or float32
-        model_load_torch_dtype = torch.float32
-        print_rank0_info(
-            f"QLoRA active: Loading base model in torch.float32 for non-quantized parts. QLoRA compute dtype: {amp_dtype}."
-        )
-else:  # Not using QLoRA
-    model_load_torch_dtype = amp_dtype
-    print_rank0_info(f"QLoRA not active: Loading model in {model_load_torch_dtype}.")
+    print_rank0_info(
+        f"QLoRA active: Model `torch_dtype` and `bnb_4bit_quant_storage` will be {model_load_torch_dtype}. "
+        f"QLoRA compute dtype (`bnb_4bit_compute_dtype`) will be {amp_dtype}."
+    )
+else:
+    print_rank0_info(
+        f"QLoRA not active: Loading model with `torch_dtype` {model_load_torch_dtype}."
+    )
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit=args.use_qlora,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=amp_dtype,
+    bnb_4bit_compute_dtype=amp_dtype,  # Compute dtype for BnB operations
     bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_storage=torch.float16,
+    bnb_4bit_quant_storage=model_load_torch_dtype
+    if args.use_qlora
+    else None,  # Storage dtype for 4-bit weights, must match model's float type for FSDP
 )
 model = AutoModelForCausalLM.from_pretrained(
     args.model_name_or_path,
