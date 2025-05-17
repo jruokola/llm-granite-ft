@@ -10,7 +10,7 @@
 #SBATCH --export=ALL             # propagate env to Pyxis
 
 ############################ 0. constants & job paths ######################### 
-IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-38:latest" # 38 QLora+DDP+AMP works
+IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-38:latest" # 38 QLora+DDPs+AMP works
 JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord"
 HOST_JOBDIR="/mnt/jail/${JOB_DIR}"

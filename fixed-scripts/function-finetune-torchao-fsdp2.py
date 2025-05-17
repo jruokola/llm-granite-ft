@@ -34,7 +34,7 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,  # Still used for some types/enums
 )
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    MixedPrecisionPolicy,  # FSDP2 style policy
+    MixedPrecision,  # FSDP2 style policy (using MixedPrecision as per error hint)
     StateDictType,
 )
 from torch.utils.data import DataLoader, Dataset
@@ -479,18 +479,18 @@ if not args.no_fsdp:
     fsdp_mp_policy = None
     if not args.disable_amp:  # Only configure if AMP is not disabled
         if amp_dtype == torch.bfloat16:
-            fsdp_mp_policy = MixedPrecisionPolicy(
+            fsdp_mp_policy = MixedPrecision(
                 param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
             )
             print_rank0_info(
-                "FSDP2 MixedPrecisionPolicy: param_dtype=bf16, reduce_dtype=bf16"
+                "FSDP2 MixedPrecision: param_dtype=bf16, reduce_dtype=bf16"
             )
         elif amp_dtype == torch.float16:
-            fsdp_mp_policy = MixedPrecisionPolicy(
+            fsdp_mp_policy = MixedPrecision(
                 param_dtype=torch.float16, reduce_dtype=torch.float32
             )  # Reduce in fp32 for stability
             print_rank0_info(
-                "FSDP2 MixedPrecisionPolicy: param_dtype=fp16, reduce_dtype=fp32"
+                "FSDP2 MixedPrecision: param_dtype=fp16, reduce_dtype=fp32"
             )
         # If amp_dtype is float32 (e.g. AMP disabled), fsdp_mp_policy can remain None or be explicit.
 
