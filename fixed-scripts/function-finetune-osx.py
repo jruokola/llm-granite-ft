@@ -2,6 +2,7 @@ import argparse
 import logging
 import math
 import os
+import sys  # Import sys
 import time
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -12,7 +13,7 @@ import torch
 # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 # from torch.nn.parallel import DistributedDataParallel as DDP
 # from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
-from datasets import load_dataset
+from datasets import load_from_disk  # Added load_from_disk
 from torch.amp import GradScaler  # Will be made conditional or adapted
 from torch.utils.data import DataLoader, Dataset
 
@@ -21,15 +22,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Parse command line arguments
 parser = argparse.ArgumentParser()
-# Removed FSDP/DDP related arguments as they are for distributed training
-# parser.add_argument(
-#     "--no_fsdp", action="store_true", help="Train with DDP instead of FSPD."
-# )
-# parser.add_argument(
-#     "--no_layer_wrap_policy",
-#     action="store_true",
-#     help="Don't use custom FSDP layer wrap policy.",
-# )
+parser.add_argument(
+    "--processed_dataset_path",
+    type=str,
+    required=True,
+    help="Path to the processed dataset on disk.",
+)
 parser.add_argument(
     "--batch_size_per_device",
     type=int,
@@ -55,7 +53,7 @@ parser.add_argument(
 parser.add_argument(
     "--max_seq_length",
     type=int,
-    default=2048,
+    default=512,
     help="Maximum sequence length for truncation.",
 )
 parser.add_argument(
@@ -94,7 +92,7 @@ parser.add_argument(
 parser.add_argument(
     "--eval_steps",
     type=int,
-    default=100,
+    default=10,
     help="Number of steps between evaluations",
 )
 parser.add_argument(
@@ -107,13 +105,8 @@ args = parser.parse_args()
 
 # --- macOS/Single Device Setup ---
 # Determine device
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    # torch.mps.empty_cache() # Good practice for MPS
-elif torch.cuda.is_available():  # Should not be true on OSX, but good for portability
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+# Logger needs to be defined before this block if it's used within.
+# Moved logger definition up.
 
 # Distributed settings for single process (rank 0, world size 1)
 IS_DISTRIBUTED = False
@@ -124,7 +117,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # Define logger earlier
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    # torch.mps.empty_cache() # Good practice for MPS
+else:
+    device = torch.device("cpu")
+    logger.info("MPS not available, defaulting to CPU. Training might be very slow.")
 
 
 _mps_bf16_warning_logged = False  # Flag to ensure warning is logged only once
@@ -150,7 +150,7 @@ def mps_check_bf16_support():
 
 # Function calling dataset processor
 class FunctionCallingDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_length=2048, subset_size=-1):
+    def __init__(self, dataset, tokenizer, max_length=512, subset_size=-1):
         self.tokenizer = tokenizer
         if subset_size > 0:
             self.dataset = dataset.select(range(min(subset_size, len(dataset))))
@@ -500,8 +500,7 @@ def train(model, train_dataset, eval_dataset, args):
 
             if device.type == "mps":
                 torch.mps.empty_cache()
-            elif device.type == "cuda":
-                torch.cuda.empty_cache()
+            # Removed CUDA specific empty_cache
 
         epoch_time = time.time() - epoch_start_time
         logger.info(
@@ -553,8 +552,7 @@ if __name__ == "__main__":
 
     # Fix seed
     torch.manual_seed(42)
-    if device.type == "cuda":  # Should not happen on OSX
-        torch.cuda.manual_seed_all(42)
+    # Removed CUDA specific seed
 
     # --- Main Execution ---
     logger.info(f"Loading tokenizer and model from: {args.model_name_or_path}...")
@@ -570,10 +568,13 @@ if __name__ == "__main__":
             "MPS device detected, bfloat16 not supported by this device/PyTorch version. Using float16 for model loading if AMP enabled."
         )
         model_dtype = torch.float16
-    elif device.type == "cpu" and not args.disable_amp:
+    elif (
+        device.type == "cpu" and not args.disable_amp
+    ):  # Ensure bfloat16 is attempted on CPU if AMP not disabled
         logger.info(
             "CPU device detected. Using bfloat16 for model loading if AMP enabled (requires PyTorch 1.10+ for CPU AMP)."
         )
+        # model_dtype remains torch.bfloat16 as per initial assignment
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
@@ -586,16 +587,49 @@ if __name__ == "__main__":
         f"Tokenizer and model loaded. Model is on {model.device} with dtype {model.dtype}"
     )
 
-    logger.info("Loading Function Calling dataset...")
-    raw_dataset = load_dataset("glaiveai/glaive-function-calling-v2")
-    logger.info(f"Dataset loaded. Size: {len(raw_dataset['train'])} examples")
+    logger.info(f"Loading dataset from disk: {args.processed_dataset_path}...")
+    try:
+        processed_dataset = load_from_disk(args.processed_dataset_path)
+    except Exception as e:
+        logger.error(
+            f"Failed to load dataset from {args.processed_dataset_path}: {e}",
+            exc_info=True,
+        )
+        sys.exit(1)
 
-    train_size = int(0.9 * len(raw_dataset["train"]))
-    eval_size = len(raw_dataset["train"]) - train_size
-    train_dataset_raw = raw_dataset["train"].select(range(train_size))
-    eval_dataset_raw = raw_dataset["train"].select(
-        range(train_size, train_size + eval_size)
-    )
+    logger.info(f"Dataset loaded. Size: {len(processed_dataset)} examples")
+
+    # Assuming the loaded dataset is a single split (e.g., 'train') or needs to be treated as such.
+    # If it's a DatasetDict, you might need to select a split, e.g., processed_dataset['train']
+    # For simplicity, assuming it's directly usable or the user provides a pre-split dataset.
+
+    # Splitting the loaded dataset
+    try:
+        # Attempt to split if it's a single dataset, common for preprocessed data
+        total_size = len(processed_dataset)
+        train_size = int(0.9 * total_size)
+        # Ensure eval_size is at least 0, even if 0.9 * total_size is total_size (e.g. for small datasets)
+        eval_size = max(0, total_size - train_size)
+
+        train_dataset_raw = processed_dataset.select(range(train_size))
+        if eval_size > 0:
+            eval_dataset_raw = processed_dataset.select(range(train_size, total_size))
+        else:  # Handle case where dataset is too small for a 90/10 split to yield a non-empty eval set
+            eval_dataset_raw = processed_dataset.select([])  # Empty dataset
+            logger.warning(
+                "Evaluation dataset is empty due to small total dataset size or 90/10 split resulting in zero eval samples."
+            )
+
+    except AttributeError as e:
+        logger.error(
+            f"Failed to split dataset. Ensure '{args.processed_dataset_path}' points to a single Hugging Face Dataset object that can be .select()ed. Error: {e}"
+        )
+        sys.exit(1)
+    except Exception as e:  # Catch other potential errors during split
+        logger.error(
+            f"An unexpected error occurred during dataset splitting: {e}", exc_info=True
+        )
+        sys.exit(1)
 
     logger.info(f"Train dataset size: {len(train_dataset_raw)}")
     logger.info(f"Eval dataset size: {len(eval_dataset_raw)}")
@@ -604,22 +638,25 @@ if __name__ == "__main__":
         train_dataset_raw,
         tokenizer,
         max_length=args.max_seq_length,
-        subset_size=args.dataset_subset_size,
+        subset_size=args.dataset_subset_size,  # subset_size here applies *after* the 90/10 split
     )
-    eval_subset_size = (
-        args.dataset_subset_size
-        if args.dataset_subset_size > 0
-        and args.dataset_subset_size < len(eval_dataset_raw)
-        else -1
-    )
-    if args.dataset_subset_size > 0 and eval_subset_size == -1:
-        eval_subset_size = min(1000, len(eval_dataset_raw))
+
+    # Adjust eval_subset_size logic based on the already split eval_dataset_raw
+    effective_eval_subset_size = -1  # Default to full (split) eval set
+    if args.dataset_subset_size > 0:  # If a global subset size is requested for testing
+        # Apply this as a cap to the eval set, or a smaller fixed number if eval set is large
+        if len(eval_dataset_raw) > 0:
+            effective_eval_subset_size = min(
+                args.dataset_subset_size, len(eval_dataset_raw), 1000
+            )  # Cap at 1000 for eval subset
+        else:
+            effective_eval_subset_size = 0  # If eval_dataset_raw is empty
 
     eval_dataset = FunctionCallingDataset(
         eval_dataset_raw,
         tokenizer,
         max_length=args.max_seq_length,
-        subset_size=eval_subset_size,
+        subset_size=effective_eval_subset_size,
     )
 
     if args.output_dir:
