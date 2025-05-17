@@ -10,14 +10,14 @@ RUN uv pip install --no-cache \
     torchaudio \
     datasets \
     huggingface_hub[hf_xet] \
-    transfomers \
+    transformers \
     peft \
     bitsandbytes
 
 # Install remaining dependencies using uv sync
 # uv sync should respect the already installed PyTorch packages if versions are compatible
 # --no-cache helps keep Docker layers smaller.
-RUN uv sync --no-cache
+#RUN uv sync --no-cache
 
 # Copy the training script
 # Adjust path if strategic_game_chess.jsonl is also needed and not bundled or downloaded by the script
