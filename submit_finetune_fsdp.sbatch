@@ -54,7 +54,7 @@ torchrun \
     --max-restarts=0 \
     --nproc-per-node=1 \
     --rdzv-id=${SLURM_JOB_ID} \
-    --rdzv-backend="c10d" \
+    --rdzv-backend=c10d \
     --rdzv-endpoint="worker-0.soperator-worker-svc.soperator.svc.cluster.local:${MASTER_PORT}" \
     function-finetune-fixed.py ${FINETUNE_ARGS}"
 
