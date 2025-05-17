@@ -143,8 +143,12 @@ This script is used to launch `fixed-scripts/function-finetune-fixed.py`. Place 
   * `--output_dir` is set to `${CONT_JOBDIR}/checkpoints` (where `CONT_JOBDIR` is `/job_data` inside the container).
   * `--processed_dataset_path` should be set to the path where the synthetic dataset was saved by `generate_granite_fc_examples.py` (e.g., `/path/on/shared/storage/my_synthetic_fc_dataset` if generated outside the container, or a path within the container if copied during image build or mounted). The sbatch script example might use a placeholder like `/job_data/synthetic_dataset` which you would need to ensure is correctly populated or mounted.
   * `--use_qlora` is passed by default, enabling QLoRA.
-  * `--use_fp8` is also passed by default in the sbatch script, enabling FP8 for LoRA layers if `transformer_engine` is available and other conditions are met (e.g., compatible `lora_r`). 
-  * The `--disable_amp` argument is **not** passed by default in the current sbatch script. The Python script `function-finetune-fixed.py` now handles AMP logic internally (e.g., BF16 without GradScaler by default if AMP is on and FP8 is off).
+  * `--use_fp8` is also passed by default in the sbatch script. If enabled:
+    * LoRA layers are converted to Transformer Engine FP8 layers.
+    * The script internally sets the precision for non-TE components to `torch.float16`. Standard `torch.autocast` for AMP will use `torch.float16` for these parts.
+  * The `--disable_amp` argument is **not** passed by default.
+    * If `--use_fp8` is active, non-TE parts run in `torch.float16` AMP. To run non-TE parts in FP32 while TE layers use FP8, you would add `--disable_amp` to `FINETUNE_ARGS`.
+    * If `--use_fp8` is *not* active, the script uses the `--amp_precision_mode` (defaulting to `bf16`) for AMP.
   * Other arguments for `function-finetune-fixed.py` (e.g., `--batch_size_per_device`, `--learning_rate`, other LoRA parameters) can be added to `FINETUNE_ARGS` in the sbatch script.
   * **Important Considerations for `FINETUNE_ARGS` (previously `FINETUNE_CLI_ARGS`):**
     * **`--batch_size_per_device`**: The script `function-finetune-fixed.py` defaults this to 16. For large models like Granite 3.3B, especially on GPUs with ~80GB memory, even this might be too high. It's recommended to start with a smaller value (e.g., 4 or 8) and enable `--gradient_checkpointing` to prevent Out-Of-Memory errors. Adjust based on your specific GPU memory and model size.
@@ -203,13 +207,17 @@ Ensure the paths to the sbatch scripts are correct.
     * Includes logic to set `ignored_modules` for FSDP, particularly for handling potential `int8` parameters from quantization.
     * Uses `sync_module_states=True` and `StateDictType.FULL_STATE_DICT` for robust checkpointing.
   * **QLoRA:** Enabled via the `--use_qlora` flag.
-    * Configures `BitsAndBytesConfig` for 4-bit quantization (`nf4`, `bnb_4bit_quant_storage=torch.float16`).
+    * Configures `BitsAndBytesConfig` for 4-bit quantization (e.g., `nf4`). The `bnb_4bit_quant_storage` is aligned with the model's `amp_dtype` for FSDP compatibility.
     * Uses `peft.prepare_model_for_kbit_training` and `peft.get_peft_model` with `LoraConfig`.
-  * **FP8 Support (Optional):** Includes experimental support for NVIDIA Transformer Engine FP8 for LoRA adapters (`--use_fp8`), if `transformer_engine` is available.
+  * **FP8 Support (Optional via Transformer Engine):** Includes experimental support for NVIDIA Transformer Engine FP8 for LoRA adapters (`--use_fp8`), if `transformer_engine` is available.
+    * **Important Note on FP8 and AMP:** When using `--use_fp8` with Transformer Engine, standard PyTorch Automatic Mixed Precision (`torch.autocast`) should generally be disabled (`--disable_amp`). Transformer Engine's `fp8_autocast` context manages its own precision for FP8 layers, and the surrounding non-TE operations will run in the precision determined by `--disable_amp` (FP32) or implicitly by the TE FP8 setup (often FP16 for non-TE parts if AMP is not explicitly disabled). The script `function-finetune-fixed.py` sets `amp_dtype` to `torch.float16` if `--use_fp8` is active and AMP is not disabled, which means non-TE parts run under `torch.autocast("cuda", dtype=torch.float16)`.
   * **Data Handling:**
     * **Requires preprocessed data:** The script loads data using `datasets.load_from_disk` via the mandatory `--processed_dataset_path` argument. On-the-fly processing of raw datasets is no longer supported in this version.
     * Uses a custom `Split` class (a wrapper around a Hugging Face `Dataset` split).
-  * **Mixed Precision:** AMP is enabled by default using `torch.bfloat16` and `GradScaler`. Can be disabled with `--disable_amp` (falls back to `torch.float32` for `bnb_4bit_compute_dtype` if QLoRA is also off, otherwise `amp_dtype` becomes `float32`).
+  * **Mixed Precision (AMP):**
+    * If `--use_fp8` is **not** enabled, AMP is active by default, typically using `torch.bfloat16` (if supported) or `torch.float16`. A `GradScaler` (standard or sharded for FSDP) is used with `torch.float16`.
+    * If `--use_fp8` **is** enabled, non-TE parts of the model operate under `torch.autocast` with `torch.float16` (unless `--disable_amp` is also passed, then they use FP32).
+    * AMP can be fully disabled with `--disable_amp`.
   * **Optimizer & Scheduler:** Uses `torch.optim.AdamW` and a linear warmup LR schedule.
   * **Gradient Checkpointing:** Supported via `--gradient_checkpointing`.
   * **Logging & Checkpointing:** Standard logging and checkpoint saving logic, compatible with FSDP.

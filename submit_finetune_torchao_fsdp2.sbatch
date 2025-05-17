@@ -10,8 +10,16 @@
 #SBATCH --export=ALL             # propagate env to Pyxis
 
 ############################ 0. constants & job paths #########################
-# finetune-fsdp2-*:latest NVIDIA PyTorch25.04 + CUDA12.6 Base Image
-# finetune-fsdp2v2-*:latest PyTorch27.04 + CUDA12.8 Base Image
+# finetune-fsdp2-*:latest NVIDIA PyTorch25.03, CUDA12.8 Base Image
+# finetune-fsdp2v2-*:latest PyTorch27.00, CUDA12.8 Base Image
+# function-finetune-torchao-fsdp2.py
+# QLoRa+FSDP2+AMP works 
+# QLoRa+DDP+AMP works 
+# QLoRa+FSDP2+AMP+FP8
+# QLoRa+DDP+AMP+FP8
+# LoRA+DDP+AMP+FP8
+# LoRa+DDP+FP8
+# DDP+FP8
 IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-fsdp2-1:latest"
 JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord" # For c10d backend if needed, though endpoint is hardcoded
