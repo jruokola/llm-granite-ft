@@ -10,13 +10,14 @@
 #SBATCH --export=ALL             # propagate env to Pyxis
 
 ############################ 0. constants & job paths #########################
-# IMPORTANT: Update this to the name of your new Docker image built with Dockerfile.torchao_fsdp2
+# finetune-fsdp2-*:latest NVIDIA PyTorch25.04 + CUDA12.6 Base Image
+# finetune-fsdp2v2-*:latest PyTorch27.04 + CUDA12.8 Base Image
 IMAGE="cr.eu-north1.nebius.cloud/e00hdcpaq6azg81mmp/finetune-fsdp2-1:latest"
 JOB_DIR="/slurm_jobs/${SLURM_JOB_ID}"
 COORD_DIR="${JOB_DIR}/coord" # For c10d backend if needed, though endpoint is hardcoded
 HOST_JOBDIR="/mnt/jail/${JOB_DIR}" # Example host path, adjust if different
 CONT_JOBDIR="/job_data"
-CONT_DATADIR="/processed_datasets/glaive_fc_v2/" # Assuming same dataset
+CONT_DATADIR="/processed_datasets/glaive_fc_v2/"
 
 mkdir -p "${COORD_DIR}"
 chmod -R 777 "${JOB_DIR}" # Ensure permissions for container access
@@ -40,7 +41,7 @@ export PYXIS_VERBOSE=3
 export TORCH_DISTRIBUTED_TIMEOUT=1800
 export HF_DATASETS_CACHE="${CONT_JOBDIR}/hf_cache"
 export TOKENIZERS_PARALLELISM=false
-# export FLASH_ATTENTION_FORCE_CUDA=1 # Keep if your model/setup benefits from it
+# export FLASH_ATTENTION_FORCE_CUDA=1 # H100 has flash attention 2 by default
 export PYTHONUNBUFFERED=1
 
 ############################ 3. python CLI ####################################
