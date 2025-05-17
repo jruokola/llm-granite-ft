@@ -18,17 +18,19 @@ ROLE_AVAILABLE_TOOLS_GRANITE = "available_tools"
 
 
 # Helper print functions (defined early)
-def print(*args, **kwargs):
+def log_info(*args, **kwargs):  # Renamed from print
     # Simple print for non-distributed script, or for rank 0 if run in such context
     if int(os.getenv("RANK", "0")) == 0:
-        print(*args, **kwargs)
+        # Call the built-in print function
+        __builtins__.print(*args, **kwargs)
         if "file" not in kwargs or kwargs["file"] == sys.stdout:
             sys.stdout.flush()
 
 
-def eprint(*args, **kwargs):
+def log_error(*args, **kwargs):  # Renamed from eprint
     if int(os.getenv("RANK", "0")) == 0:
-        print(*args, file=sys.stderr, **kwargs)
+        # Call the built-in print function
+        __builtins__.print(*args, file=sys.stderr, **kwargs)
         sys.stderr.flush()
 
 
@@ -258,10 +260,10 @@ if __name__ == "__main__":
 
     script_args = parser.parse_args()
 
-    print(f"Generating {script_args.num_examples} synthetic examples...")
+    log_info(f"Generating {script_args.num_examples} synthetic examples...")
     text_examples = generate_examples(script_args.num_examples)
 
-    print(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
+    log_info(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.tokenizer_name_or_path, trust_remote_code=True
     )
@@ -274,22 +276,22 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         if tokenizer.eos_token:
             tokenizer.pad_token = tokenizer.eos_token
-            print(
+            log_info(
                 f"Set tokenizer.pad_token to tokenizer.eos_token: {tokenizer.eos_token}"
             )
         else:
             tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # Fallback
-            print("Added [PAD] as pad_token.")
+            log_info("Added [PAD] as pad_token.")
 
     all_input_ids = []
     all_attention_masks = []
     all_labels = []
 
-    print("Tokenizing and creating labels for generated examples...")
+    log_info("Tokenizing and creating labels for generated examples...")
     for i, text_content in enumerate(text_examples):
         if int(os.getenv("RANK", "0")) == 0 and i < 2:  # Print first 2 formatted texts
-            print(f"\n--- Generated Example {i + 1} Text (to be tokenized) ---")
-            print(
+            log_info(f"\n--- Generated Example {i + 1} Text (to be tokenized) ---")
+            log_info(
                 text_content[:1000] + "..."
                 if len(text_content) > 1000
                 else text_content
@@ -329,8 +331,8 @@ if __name__ == "__main__":
         features=features,
     )
 
-    print(
+    log_info(
         f"Saving processed dataset with {len(hf_dataset)} examples to {script_args.output_path}..."
     )
     hf_dataset.save_to_disk(script_args.output_path)
-    print("--- Synthetic Dataset Generation Complete ---")
+    log_info("--- Synthetic Dataset Generation Complete ---")
