@@ -624,6 +624,15 @@ if not args.no_fsdp:
     # and then applying fully_shard. The model object `model` is modified in-place.
 
     # FSDP expects `ignored_modules` to be a list of module instances.
+    # from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy # Keep for now if needed by FSDP internals
+
+    # sharding_strategy = (
+    #     ShardingStrategy.FULL_SHARD
+    #     if args.reshard_after_forward
+    #     else ShardingStrategy.SHARD_GRAD_OP
+    # )
+
+    # FSDP expects `ignored_modules` to be a list of module instances.
     from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
 
     sharding_strategy = (
@@ -636,11 +645,12 @@ if not args.no_fsdp:
     model = FSDP(
         model,
         sharding_strategy=sharding_strategy,
-        device_mesh=device_mesh,
+        device_mesh=device_mesh,  # device_mesh is initialized earlier
         mixed_precision=fsdp_mp_policy,
         ignored_modules=fsdp_ignored_modules_list
         if fsdp_ignored_modules_list
-        else None,  # Use ignored_modules
+        else None,
+        use_orig_params=True,  # Retained for QLoRA compatibility
     )
     print_rank0_info(
         f"FSDP (FSDP2 style) wrapping complete with sharding_strategy: {sharding_strategy}."

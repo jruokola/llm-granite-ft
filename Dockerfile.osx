@@ -27,7 +27,7 @@ RUN uv pip install \
 # Adjust path if strategic_game_chess.jsonl is also needed and not bundled or downloaded by the script
 COPY fixed-scripts/function-finetune-osx.py .
 # COPY DATASET
-COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
+COPY glaive_fc_v2/ processed_datasets/glaive_fc_v2/
 # Set environment variable for transformers
 ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 # Place executables in the environment at the front of the path
@@ -35,4 +35,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Provide a shell for interactive debugging
 #CMD ["bash"]
 # Alternatively, to run the script directly (ensure it handles CPU execution):
-CMD ["uv","run","python","./function-finetune-osx.py","--processed_dataset_path","./processed_datasets/glaive_fc_v2"]
+CMD ["uv","run","python","function-finetune-osx.py","--processed_dataset_path","processed_datasets/glaive_fc_v2"]
