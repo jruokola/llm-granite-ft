@@ -49,7 +49,8 @@ from transformers import (
 try:
     import torchao
     from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-    from torchao.float8.config import Float8Recipe  # For mapping string to enum
+
+    # Removed: from torchao.float8.config import Float8Recipe
     from torchao.float8.fsdp import (
         enable_fsdp_float8_all_gather,
         force_recompute_fp8_weight_in_bwd,
@@ -67,18 +68,13 @@ except ModuleNotFoundError:
     def convert_to_float8_training(model, module_filter_fn=None, linear_config=None):
         return model
 
-    class Float8LinearConfig:
-        def __init__(self, recipe=None):
-            self.recipe = recipe if recipe else "DUMMY_DYNAMIC"
+    class Float8LinearConfig:  # Dummy for when torchao is not found
+        def __init__(self, recipe=None):  # recipe here will be a string
+            self.recipe_str = (
+                recipe if recipe else "dynamic"
+            )  # Store as string, ensure it has a default
 
-    class Float8Recipe:  # Simplified dummy
-        DYNAMIC = "DYNAMIC"
-        TENSOR = "TENSOR"
-        ROWWISE = "ROWWISE"
-
-        @classmethod
-        def __getitem__(cls, key):  # Allow dummy[key]
-            return getattr(cls, key, "DUMMY_UNKNOWN")
+    # Removed dummy Float8Recipe class
 
     def enable_fsdp_float8_all_gather(enabled: bool = True):
         pass
@@ -403,28 +399,33 @@ if args.use_fp8_torchao and TORCHAO_OK:
             f"Attempting FP8 conversion using convert_to_float8_training with recipe: {args.float8_recipe_name}..."
         )
 
-        try:
-            recipe_enum_key = args.float8_recipe_name.upper()
-            if (
-                recipe_enum_key not in Float8Recipe.__members__
-            ):  # Check if key is valid for enum
-                print_rank0_error(
-                    f"Invalid float8_recipe_name: {args.float8_recipe_name}. Defaulting to DYNAMIC."
-                )
-                recipe_enum = Float8Recipe.DYNAMIC
-            else:
-                recipe_enum = Float8Recipe[recipe_enum_key]
-            config = Float8LinearConfig(recipe=recipe_enum)
-            print_rank0_info(f"Created Float8LinearConfig with recipe: {config.recipe}")
-        except KeyError:  # Fallback if string to enum mapping fails for some reason
+        # Use recipe string directly
+        recipe_str = args.float8_recipe_name.lower()
+        allowed_recipes = [
+            "tensor",
+            "rowwise",
+            "dynamic",
+        ]  # Defined by argparse choices
+        if recipe_str not in allowed_recipes:
             print_rank0_error(
-                f"Failed to map float8_recipe_name '{args.float8_recipe_name}' to Float8Recipe. Defaulting to DYNAMIC."
+                f"Invalid float8_recipe_name: '{args.float8_recipe_name}'. Defaulting to 'dynamic'."
             )
-            config = Float8LinearConfig(recipe=Float8Recipe.DYNAMIC)
+            recipe_str = "dynamic"
+
+        config = Float8LinearConfig(recipe=recipe_str)  # Pass the string directly
+        # For logging, if TORCHAO_OK, config.recipe might be an enum, otherwise it's config.recipe_str from the dummy
+        current_recipe_log = (
+            config.recipe
+            if hasattr(config, "recipe") and not isinstance(config.recipe, str)
+            else recipe_str
+        )
+        print_rank0_info(
+            f"Created Float8LinearConfig with recipe: {current_recipe_log}"
+        )
 
         # Apply FSDP-specific torchao settings using imported functions
-        # These apply if recipe is tensor-based (DYNAMIC or TENSOR)
-        if config.recipe in [Float8Recipe.DYNAMIC, Float8Recipe.TENSOR]:
+        # These apply if recipe is tensor-based ("dynamic" or "tensor")
+        if recipe_str in ["dynamic", "tensor"]:
             if args.float8_enable_fsdp_all_gather:
                 enable_fsdp_float8_all_gather(True)
                 print_rank0_info(
@@ -466,14 +467,19 @@ if args.use_fp8_torchao and TORCHAO_OK:
                 or args.float8_force_recompute_weight_bwd
             ):
                 print_rank0_info(
-                    f"FSDP-specific FP8 flags are not applicable for recipe '{config.recipe}' and are ignored."
+                    f"FSDP-specific FP8 flags are not applicable for recipe '{recipe_str}' and are ignored."
                 )
 
         model = convert_to_float8_training(
             model, module_filter_fn=linear_layer_filter_fn, linear_config=config
         )
+        current_recipe_log_after = (
+            config.recipe
+            if hasattr(config, "recipe") and not isinstance(config.recipe, str)
+            else recipe_str
+        )
         print_rank0_info(
-            f"Model conversion using torchao.float8.convert_to_float8_training (recipe: {config.recipe}) completed."
+            f"Model conversion using torchao.float8.convert_to_float8_training (recipe: {current_recipe_log_after}) completed."
         )
         print_rank0_info(
             f"Dtype histogram after torchao FP8 (training API) conversion: {Counter(p.dtype for p in model.parameters())}"
