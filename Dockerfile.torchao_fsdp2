@@ -1,7 +1,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # GPU-ready HuggingFace stack + PEFT + FSDP2 + torchao FP8 fine-tuning
 # ────────────────────────────────────────────────────────────────────────────
-FROM nvcr.io/nvidia/pytorch:25.04-py3
+FROM nvcr.io/nvidia/pytorch:25.03-py3
 
 # 1 — Basic runtime hygiene
 ENV DEBIAN_FRONTEND=noninteractive \
