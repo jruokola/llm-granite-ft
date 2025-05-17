@@ -24,13 +24,11 @@ RUN python3 -m pip install --upgrade pip setuptools wheel && \
         datasets \
         transformers \
         huggingface_hub[hf_xet] \
-        accelerate \
         bitsandbytes \
-        transformer_engine \
-        contextlib
+        transformer_engine
 
 # 4 — Copy training code and data
 COPY fixed-scripts/function-finetune-fixed.py .
 COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
 
-# 5 — No CMD: I nvoke with torchrun / sbatch
+# 5 — No CMD: Invoke with torchrun / sbatch

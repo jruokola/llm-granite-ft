@@ -9,7 +9,10 @@ RUN uv pip install --no-cache \
     torchvision \
     torchaudio \
     datasets \
-    transfomers
+    huggingface_hub[hf_xet] \
+    transfomers \
+    peft \
+    bitsandbytes
 
 # Install remaining dependencies using uv sync
 # uv sync should respect the already installed PyTorch packages if versions are compatible
@@ -18,7 +21,7 @@ RUN uv sync --no-cache
 
 # Copy the training script
 # Adjust path if strategic_game_chess.jsonl is also needed and not bundled or downloaded by the script
-COPY fixed-scripts/function-finetune-fixed.py .
+COPY fixed-scripts/function-finetune-osx.py .
 # COPY DATASET
 COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
 # Set environment variable for transformers
