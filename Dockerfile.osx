@@ -5,7 +5,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN uv venv
 # Install PyTorch, torchvision, and torchaudio for MPS on OsX
 RUN uv pip install --no-cache \
-    torch\
+    torch \
     torchvision \
     torchaudio \
     datasets \
@@ -30,4 +30,4 @@ ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 # Provide a shell for interactive debugging
 #CMD ["bash"]
 # Alternatively, to run the script directly (ensure it handles CPU execution):
-CMD ["python", "./function-finetune-osx.py"]
+CMD ["uv run python", "./function-finetune-osx.py"]
