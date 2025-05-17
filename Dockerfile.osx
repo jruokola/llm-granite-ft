@@ -1,10 +1,14 @@
 # Use a standard Python base image
 FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# set workdir
+WORKDIR /app
 # Create venv
 RUN uv venv
+# Enable bytecode compilation
+ENV UV_COMPILE_BYTECODE=1
 # Install PyTorch, torchvision, and torchaudio for MPS on OsX
-RUN uv pip install --no-cache \
+RUN uv pip install \
     torch \
     torchvision \
     torchaudio \
@@ -26,8 +30,9 @@ COPY fixed-scripts/function-finetune-osx.py .
 COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
 # Set environment variable for transformers
 ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-
+# Place executables in the environment at the front of the path
+ENV PATH="/app/.venv/bin:$PATH"
 # Provide a shell for interactive debugging
-#CMD ["bash"]
+CMD ["bash"]
 # Alternatively, to run the script directly (ensure it handles CPU execution):
-CMD ["uv run python", "./function-finetune-osx.py"]
+#CMD ["uv run python", "./function-finetune-osx.py"]
