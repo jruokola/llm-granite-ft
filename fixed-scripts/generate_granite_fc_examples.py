@@ -315,9 +315,9 @@ if __name__ == "__main__":
     # Define features for the dataset
     features = Features(
         {
-            "input_ids": Sequence(feature=Value(dtype="int32")),
-            "attention_mask": Sequence(feature=Value(dtype="int8")),
-            "labels": Sequence(feature=Value(dtype="int64")),
+            "input_ids": Sequence(feature=Value(dtype="int32"), length=-1),
+            "attention_mask": Sequence(feature=Value(dtype="int8"), length=-1),
+            "labels": Sequence(feature=Value(dtype="int64"), length=-1),
         }
     )
 
