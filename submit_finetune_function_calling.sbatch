@@ -12,13 +12,13 @@
 ############################ 0. constants & job paths ######################### 
 # Tested finetune-38:latest
 # function-finetune-fixed.py
-# QLoRa+FSDP+AMP works lr:6e-5, batch_size_per_device=16
-# QLoRa+DDP+AMP works lr:6e-5, batch_size_per_device=16
+# QLoRa+FSDP+AMP works - lr:6e-5, batch_size_per_device=16
+# QLoRa+DDP+AMP works - lr:6e-5, batch_size_per_device=16
 # QLoRa+FSDP+AMP+FP8 doesn't work - unstability and nan loss with lr:6e-5, batch_size_per_device=16
 # QLoRa+DDP+AMP+FP8 doesn't work - unstability and nan loss with lr:6e-5, batch_size_per_device=16
 # QLoRa+FSDP+FP8 works - lr: 6e-5, batch_size_per_device=2
 # QLoRa+DDP+FP8 works - lr: 6e-5, batch_size_per_device=2
-# LoRa+FSDP+AMP+FP8 works -  lr: 6e-5, batch_size_per_device=2
+# LoRa+FSDP+AMP+FP8 works -lr: 6e-5, batch_size_per_device=2
 # LoRa+FSDP+FP8 works -  lr: 6e-5, batch_size_per_device=2
 # LoRa+DDP+AMP+FP8 doesn't work - unstability and nan loss with lr:6e-5, batch_size_per_device=2
 # LoRa+DDP+FP8 works - lr: 6e-5, batch_size_per_device=2
