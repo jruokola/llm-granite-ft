@@ -500,46 +500,43 @@ if args.use_fp8_torchao and TORCHAO_OK:
         )
         args.use_fp8_torchao = False  # Fallback to non-FP8 path
 
-# FSDP ignored parameters for QLoRA
-# For FSDP2, we store Fully Qualified Names (FQNs) of parameters to ignore.
-fsdp_ignored_param_fqns = set()
+# FSDP ignored modules for QLoRA
+fsdp_ignored_modules_list = []
+params_in_ignored_modules_fqns = set()  # To skip casting these later
+
 if args.use_qlora:
-    print_rank0_info(
-        "Identifying FQNs of BitsAndBytes parameters to ignore for FSDP2..."
-    )
-    # Iterate through the model *before* FSDP wrapping to get original FQNs
-    for fqn, module in model.named_modules():
+    print_rank0_info("Identifying BitsAndBytes modules to ignore for FSDP2...")
+    for module_name, module in model.named_modules():
         if "bitsandbytes.nn.modules" in str(type(module)).lower():
-            for param_name, param in module.named_parameters(recurse=False):
-                # Construct the FQN of the parameter
-                param_fqn = f"{fqn}.{param_name}" if fqn else param_name
-                fsdp_ignored_param_fqns.add(param_fqn)
-    if fsdp_ignored_param_fqns:
+            if module not in fsdp_ignored_modules_list:  # Ensure uniqueness
+                fsdp_ignored_modules_list.append(module)
+            # Also collect FQNs of parameters within these modules to prevent casting them
+            for param_fqn, _ in module.named_parameters():
+                full_param_fqn = (
+                    f"{module_name}.{param_fqn}" if module_name else param_fqn
+                )
+                params_in_ignored_modules_fqns.add(full_param_fqn)
+
+    if fsdp_ignored_modules_list:
         print_rank0_info(
-            f"Identified {len(fsdp_ignored_param_fqns)} BitsAndBytes parameter FQNs to ignore for FSDP2."
+            f"Identified {len(fsdp_ignored_modules_list)} BitsAndBytes modules to ignore for FSDP2."
         )
     else:
         print_rank0_info(
-            "No BitsAndBytes parameter FQNs found to ignore for FSDP (this might be unexpected if QLoRA is used)."
+            "No BitsAndBytes modules found to ignore for FSDP (this might be unexpected if QLoRA is used)."
         )
 
 # Cast parameters not handled by torchao FP8 or BnB to amp_dtype
-# This loop needs to be careful not to interfere with torchao's FP8 parameters or BnB parameters
 print_rank0_info(f"Casting remaining parameters to {amp_dtype} if necessary...")
-# It's safer to do this casting *before* FSDP wrapping if possible,
-# but FSDP2 expects parameters to be on meta device or already in the target dtype.
-# The current loop iterates after PEFT and torchao, but before FSDP wrapping.
-# We need FQNs for parameters to check against fsdp_ignored_param_fqns.
 
 param_names_to_cast = []
-for fqn, param in model.named_parameters():  # Get FQNs directly
-    is_torchao_fp8_param = False  # Placeholder, actual check might be more complex
-    # A more robust check for torchao might involve checking if the parent module is a Float8Linear
-    # or if the parameter itself has specific attributes set by torchao.
-    # For now, we assume torchao handles its parameters' dtypes correctly.
+for fqn, param in model.named_parameters():
+    is_torchao_fp8_param = False  # Placeholder
+    # Add more robust check for torchao parameters if needed, e.g., by checking parent module type
 
     if (
-        fqn not in fsdp_ignored_param_fqns
+        fqn
+        not in params_in_ignored_modules_fqns  # Check against FQNs of params in ignored modules
         and not is_torchao_fp8_param
         and param.dtype != amp_dtype
     ):
@@ -548,11 +545,9 @@ for fqn, param in model.named_parameters():  # Get FQNs directly
 if param_names_to_cast:
     print_rank0_info(
         f"Casting {len(param_names_to_cast)} parameters to {amp_dtype}: {param_names_to_cast[:5]}..."
-    )  # Log first 5
+    )
     for fqn, param in model.named_parameters():
-        if (
-            fqn in param_names_to_cast
-        ):  # Check if current param's FQN is in the list to cast
+        if fqn in param_names_to_cast:
             try:
                 param.data = param.data.to(amp_dtype)
             except Exception as e:
@@ -628,11 +623,7 @@ if not args.no_fsdp:
     # This is a conceptual change; the actual FSDP2 wrapping happens by modifying the class
     # and then applying fully_shard. The model object `model` is modified in-place.
 
-    # FSDP2 expects `ignored_parameters` to be a list of FQNs or Parameter objects.
-    # Using FQNs is more robust here.
-
-    # The model is wrapped by FSDP here.
-    # The parameters to ignore should be specified by their FQNs.
+    # FSDP expects `ignored_modules` to be a list of module instances.
     from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
 
     sharding_strategy = (
@@ -642,27 +633,14 @@ if not args.no_fsdp:
     )
 
     # FSDP2 style wrapping:
-    # For ignored_parameters, FSDP expects a list of torch.nn.Parameter objects
-    # or a list of FQNs if use_orig_params=False (which is not the case here).
-    # Since use_orig_params is not explicitly set for FSDP2 style, FSDP will manage parameters.
-    # We need to provide the actual parameter objects to ignore.
-    # However, the FQN approach is generally safer if the FSDP API supports it directly for ignored_parameters.
-    # Let's stick to providing parameter objects if that's what FSDP expects with default use_orig_params behavior.
-    # Re-fetch ignored parameters as objects *after* all model modifications but *before* FSDP.
-    final_fsdp_ignored_params_objects = []
-    if args.use_qlora:
-        for fqn, param in model.named_parameters():
-            if fqn in fsdp_ignored_param_fqns:
-                final_fsdp_ignored_params_objects.append(param)
-
     model = FSDP(
         model,
         sharding_strategy=sharding_strategy,
         device_mesh=device_mesh,
         mixed_precision=fsdp_mp_policy,
-        ignored_parameters=final_fsdp_ignored_params_objects
-        if final_fsdp_ignored_params_objects
-        else None,
+        ignored_modules=fsdp_ignored_modules_list
+        if fsdp_ignored_modules_list
+        else None,  # Use ignored_modules
     )
     print_rank0_info(
         f"FSDP (FSDP2 style) wrapping complete with sharding_strategy: {sharding_strategy}."
