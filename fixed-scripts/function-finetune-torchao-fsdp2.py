@@ -29,13 +29,15 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from torch.amp import GradScaler  # Standard GradScaler for FSDP2
+
+# Import for new state_dict API
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.distributed.device_mesh import init_device_mesh  # For FSDP2
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,  # Still used for some types/enums
 )
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     MixedPrecision,  # FSDP2 style policy (using MixedPrecision as per error hint)
-    StateDictType,
 )
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -744,40 +746,79 @@ def save(tag):
     path = os.path.join(args.output_dir, tag)
     os.makedirs(path, exist_ok=True)
 
-    # FSDP2 state_dict saving
-    # The FSDP class itself handles how state_dict is collected.
-    # For full state dict (e.g., for resuming on different #ranks or for HF conversion),
-    # FSDP provides a context manager.
-    # For sharded state_dict (rank0_only=False, offload_to_cpu=True), it's more efficient.
-    # Current script uses FULL_STATE_DICT for saving. This should still work with FSDP2.
+    # FSDP state_dict saving using the new torch.distributed.checkpoint API
     if not args.no_fsdp:  # If FSDP is active
-        # Use FSDP's state_dict_type context manager for full state dict
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-            cpu_state_dict = model.state_dict()
+        print_rank0_info("Using new get_state_dict API for FSDP model saving...")
+        # Options for full_state_dict and offloading to CPU
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        cpu_state_dict = get_state_dict(model, options=options)
+        print_rank0_info("Full state_dict collected on CPU using get_state_dict.")
 
         # Saving logic for PEFT models (common case)
-        if hasattr(model, "save_pretrained") and callable(
-            getattr(model, "save_pretrained")
+        # The model object passed to get_state_dict is the FSDP-wrapped model.
+        # For save_pretrained, we typically need the underlying model.
+        # However, PEFT's save_pretrained can often handle the FSDP-wrapped model directly
+        # or it might need the state_dict passed to it.
+        # Let's try passing the FSDP model directly first, then the state_dict.
+
+        # Access the underlying model if FSDP wraps it in a 'module' attribute,
+        # which is common but not guaranteed for all FSDP versions/setups.
+        # For PEFT models, save_pretrained is usually on the PEFT model instance.
+        model_to_save_for_hf = model  # Start with the FSDP model
+
+        # Check if the FSDP model itself has save_pretrained (PEFT might have patched it)
+        if hasattr(model_to_save_for_hf, "save_pretrained") and callable(
+            getattr(model_to_save_for_hf, "save_pretrained")
         ):
-            # If the FSDP-wrapped model (or its underlying module if FSDP does not expose it)
-            # has save_pretrained, use it. This is typical for PEFT models.
-            # FSDP might require unwrapping or accessing module for this.
-            # Let's assume model.module for FSDP, or model itself if not DDP/FSDP wrapped.
-            model_to_save = model.module if hasattr(model, "module") else model
-            if hasattr(model_to_save, "save_pretrained"):
-                model_to_save.save_pretrained(path, state_dict=cpu_state_dict)
-            else:  # Fallback if inner model also doesn't have it
-                torch.save(cpu_state_dict, os.path.join(path, "pytorch_model.bin"))
+            try:
                 print_rank0_info(
-                    f"Saved FSDP full state_dict to {os.path.join(path, 'pytorch_model.bin')} (model has no save_pretrained)"
+                    f"Attempting to save PEFT model using FSDP-wrapped model.save_pretrained with state_dict to {path}..."
                 )
-        else:  # Fallback for non-HuggingFace models or if save_pretrained is not on the FSDP object
-            torch.save(cpu_state_dict, os.path.join(path, "pytorch_model.bin"))
-            print_rank0_info(
-                f"Saved FSDP full state_dict to {os.path.join(path, 'pytorch_model.bin')}"
-            )
+                model_to_save_for_hf.save_pretrained(path, state_dict=cpu_state_dict)
+                print_rank0_info(
+                    f"PEFT model saved successfully to {path} using FSDP-wrapped model and provided state_dict."
+                )
+            except Exception as e_direct_save:
+                print_rank0_error(
+                    f"Direct save_pretrained on FSDP-wrapped model failed: {e_direct_save}. Trying with unwrapped model if possible."
+                )
+                # Fallback: try to unwrap if it's a simple FSDP(PeftModel) case
+                unwrapped_model = model.module if hasattr(model, "module") else model
+                if hasattr(unwrapped_model, "save_pretrained") and callable(
+                    getattr(unwrapped_model, "save_pretrained")
+                ):
+                    print_rank0_info(
+                        f"Attempting to save PEFT model using unwrapped_model.save_pretrained with state_dict to {path}..."
+                    )
+                    unwrapped_model.save_pretrained(path, state_dict=cpu_state_dict)
+                    print_rank0_info(
+                        f"PEFT model saved successfully to {path} using unwrapped model and provided state_dict."
+                    )
+                else:
+                    print_rank0_error(
+                        "Unwrapped model also does not have save_pretrained. Saving raw state_dict to pytorch_model.bin."
+                    )
+                    torch.save(cpu_state_dict, os.path.join(path, "pytorch_model.bin"))
+        else:  # Fallback if FSDP-wrapped model doesn't have save_pretrained
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            if hasattr(unwrapped_model, "save_pretrained") and callable(
+                getattr(unwrapped_model, "save_pretrained")
+            ):
+                print_rank0_info(
+                    f"Attempting to save PEFT model using unwrapped_model.save_pretrained with state_dict to {path}..."
+                )
+                unwrapped_model.save_pretrained(path, state_dict=cpu_state_dict)
+                print_rank0_info(
+                    f"PEFT model saved successfully to {path} using unwrapped model and provided state_dict."
+                )
+            else:
+                print_rank0_info(
+                    f"FSDP-wrapped model and unwrapped model do not have save_pretrained. Saving raw state_dict to {os.path.join(path, 'pytorch_model.bin')}"
+                )
+                torch.save(cpu_state_dict, os.path.join(path, "pytorch_model.bin"))
+
         tok.save_pretrained(path)
-    else:  # DDP or single GPU
+    else:  # DDP or single GPU (no FSDP)
         model_to_save = model.module if hasattr(model, "module") else model
         if hasattr(model_to_save, "save_pretrained"):
             model_to_save.save_pretrained(path)
