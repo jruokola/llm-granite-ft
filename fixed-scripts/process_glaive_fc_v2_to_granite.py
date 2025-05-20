@@ -130,7 +130,7 @@ def main():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=512,  # Matching generate_granite_fc_examples.py for format consistency check
+        default=4096,  # Matching generate_granite_fc_examples.py for format consistency check
         help="Maximum sequence length for tokenization.",
     )
     parser.add_argument(
@@ -144,6 +144,12 @@ def main():
         type=str,
         default="train",
         help="Dataset split to process (e.g., 'train').",
+    )
+    parser.add_argument(
+        "--num_test_samples",
+        type=int,
+        default=-1,
+        help="Number of samples to process for testing (default: -1, process all).",
     )
     script_args = parser.parse_args()
 
@@ -163,32 +169,55 @@ def main():
 
     log_info(f"Loaded {len(source_dataset)} examples from source.")
 
+    if script_args.num_test_samples > 0:
+        log_info(
+            f"Processing only the first {script_args.num_test_samples} samples for testing."
+        )
+        source_dataset = source_dataset.select(
+            range(min(script_args.num_test_samples, len(source_dataset)))
+        )
+        log_info(f"Reduced dataset to {len(source_dataset)} samples for testing.")
+
+    log_info(f"Loaded {len(source_dataset)} examples from source.")
+
+    if script_args.num_test_samples > 0:
+        log_info(
+            f"Processing only the first {script_args.num_test_samples} samples for testing."
+        )
+        source_dataset = source_dataset.select(
+            range(min(script_args.num_test_samples, len(source_dataset)))
+        )
+        log_info(f"Reduced dataset to {len(source_dataset)} samples for testing.")
+
+    skipped_assistant_tool_call_turns = 0
+    successfully_formatted_examples_count = 0
+    skipped_examples_count = 0
+
     formatted_text_examples = []
     for i, raw_example in enumerate(source_dataset):
         if i % 1000 == 0 and i > 0:
-            log_info(f"Processing example {i}...")
+            log_info(f"Formatting example {i}...")
+        elif script_args.num_test_samples > 0 and i < script_args.num_test_samples:
+            log_info(f"Formatting example {i}...")
 
         example_parts = []
+        current_example_had_issues = False
 
-        # 1. System Turn (predefined, same for all examples from this script)
+        # 1. System Turn
         example_parts.append(format_granite_turn(ROLE_SYSTEM_GRANITE, system_prompt))
 
         # 2. Available Tools Turn
-        # In glaiveai/glaive-function-calling-v2, tools are in the 'system' field.
-        # Example: "SYSTEM: You are a helpful assistant with access to the following functions. Use them if required - {json_func_def_1} {json_func_def_2}"
-        # We need to extract these JSON function definitions.
         system_field_content = raw_example.get("system", "")
         tools_marker = "Use them if required - "
-        tools_json_str = "[]"  # Default to empty list of tools
+        tools_json_str = "[]"
         if tools_marker in system_field_content:
             potential_tools_part = system_field_content.split(tools_marker, 1)[
                 -1
             ].strip()
-            # The functions are concatenated JSON objects, not a single JSON list.
-            # We need to parse them individually and then wrap them in a list.
             extracted_tools = []
             decoder = json.JSONDecoder()
             idx = 0
+            parse_tools_successful = True
             while idx < len(potential_tools_part):
                 potential_tools_part = potential_tools_part[idx:].strip()
                 if not potential_tools_part:
@@ -197,24 +226,47 @@ def main():
                     func, end_idx = decoder.raw_decode(potential_tools_part)
                     extracted_tools.append(func)
                     idx = end_idx
-                except json.JSONDecodeError:
-                    # This might happen if there's non-JSON text after the functions
-                    # or if the concatenation isn't perfect.
+                except json.JSONDecodeError as e_tool_parse:
                     log_warning(
-                        f"Could not parse all function JSONs in example {i} from: {potential_tools_part[idx : idx + 50]}..."
+                        f"Could not parse all function JSONs in example {i} from: {potential_tools_part[idx : idx + 50]}... Error: {e_tool_parse}"
                     )
+                    # If tools are critical and unparsable, we might consider this example skipped.
+                    # For now, we'll proceed with potentially empty tools_json_str if parsing fails mid-way.
+                    # If extracted_tools remains empty and the original string wasn't just "[]", it's an issue.
+                    if not extracted_tools and potential_tools_part.strip() != "[]":
+                        parse_tools_successful = (
+                            False  # Mark that tool parsing failed significantly
+                        )
                     break
             if extracted_tools:
                 tools_json_str = json.dumps(extracted_tools)
+            elif (
+                not parse_tools_successful
+            ):  # If parsing failed and no tools were extracted from a non-empty string
+                log_error(
+                    f"Example {i}: Failed to extract any tools from system field, but tools seemed present. System field: {system_field_content[:200]}"
+                )
+                # current_example_had_issues = True # Decide if this is a skippable offense
 
         example_parts.append(
             format_granite_turn(ROLE_AVAILABLE_TOOLS_GRANITE, tools_json_str)
         )
 
-        # 3. Conversation Turns from 'chat' field
-        # Example 'chat': "USER: ... ASSISTANT: ... <|endoftext|> FUNCTION RESPONSE: ... ASSISTANT: ... <|endoftext|>"
+        # 3. Conversation Turns
         chat_content = raw_example.get("chat", "")
+        if not chat_content:  # If chat is empty, this example might be problematic
+            log_warning(f"Example {i}: Empty 'chat' field.")
+            current_example_had_issues = True  # An example without a chat is not useful
+
         turns_raw = chat_content.split("<|endoftext|>")
+        if (
+            not any(turn_raw.strip() for turn_raw in turns_raw)
+            and not current_example_had_issues
+        ):  # if all turns are empty
+            log_warning(
+                f"Example {i}: 'chat' field resulted in no valid turns after split by <|endoftext|>."
+            )
+            current_example_had_issues = True
 
         for turn_raw in turns_raw:
             turn_raw = turn_raw.strip()
@@ -227,30 +279,10 @@ def main():
             elif turn_raw.startswith("ASSISTANT:"):
                 content_part = turn_raw[len("ASSISTANT:") :].strip()
                 if content_part.startswith("<functioncall>"):
-                    # Extract JSON from <functioncall> {"name": "...", "arguments": '...'}
-                    # The arguments themselves are a string that needs to be parsed if we were to use them,
-                    # but for Granite format, we just need the whole function call object string.
-                    # The official dataset has the arguments as a string, not a nested JSON object directly.
-                    # e.g. <functioncall> {"name": "get_news_headlines", "arguments": '{"country": "United States"}'}
-                    # The Granite format expects the <|tool_call|> marker followed by a JSON *list* of tool calls.
-                    # The glaive format provides a single tool call object as a string.
-
                     fc_marker_start = "<functioncall>"
-                    # The end of the function call is implicitly before <|endoftext|> or end of string
-                    # For simplicity, assume the function call is the entirety of the content_part after the marker
-
                     fc_json_str = content_part[len(fc_marker_start) :].strip()
-
-                    # The fc_json_str is like: {"name": "N", "arguments": '{"K":"V"}'}
-                    # Granite expects: [{"name": "N", "arguments": "{\"K\":\"V\""}] (a list of such objects, stringified)
-                    # So, we need to wrap fc_json_str in list brackets to make it a JSON array string.
-                    # However, the arguments within the glaive format are already a string.
-                    # Let's parse it to ensure it's valid JSON, then re-stringify it as a list item.
                     try:
-                        # Attempt to parse the function call string to validate it's a single JSON object
-                        # The arguments field is a string, which is fine for the Granite format if the outer structure is a list of calls.
-                        parsed_fc = json.loads(fc_json_str)  # This should be a dict
-                        # Wrap it as a list containing one item, then dump to string
+                        parsed_fc = json.loads(fc_json_str)
                         granite_fc_list_str = json.dumps([parsed_fc])
                         assistant_response_content = (
                             f"{TOOL_CALL_MARKER_GRANITE}{granite_fc_list_str}"
@@ -260,20 +292,18 @@ def main():
                                 ROLE_ASSISTANT_GRANITE, assistant_response_content
                             )
                         )
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
                         log_error(
-                            f"Failed to parse function call JSON in example {i}: {fc_json_str}. Using raw content part."
+                            f"Failed to parse function call JSON in example {i} (ASSISTANT turn with tool_call skipped): {fc_json_str}. Error: {e}"
                         )
-                        example_parts.append(
-                            format_granite_turn(ROLE_ASSISTANT_GRANITE, content_part)
-                        )  # Fallback
+                        skipped_assistant_tool_call_turns += 1
+                        # This turn is skipped, but the example might still be valid if other turns exist.
                 else:
                     example_parts.append(
                         format_granite_turn(ROLE_ASSISTANT_GRANITE, content_part)
                     )
             elif turn_raw.startswith("FUNCTION RESPONSE:"):
                 content = turn_raw[len("FUNCTION RESPONSE:") :].strip()
-                # Content is already the JSON string of the tool output.
                 example_parts.append(
                     format_granite_turn(ROLE_TOOL_RESPONSE_GRANITE, content)
                 )
@@ -282,9 +312,24 @@ def main():
                     f"Unrecognized turn structure in example {i}: {turn_raw[:100]}..."
                 )
 
-        formatted_text_examples.append("".join(example_parts))
+        if current_example_had_issues:
+            skipped_examples_count += 1
+        else:
+            formatted_text_examples.append("".join(example_parts))
+            successfully_formatted_examples_count += 1
 
-    log_info(f"Formatted {len(formatted_text_examples)} examples.")
+    log_info(
+        f"Successfully formatted {successfully_formatted_examples_count} examples."
+    )
+    log_info(
+        f"Skipped {skipped_examples_count} entire examples due to critical parsing issues."
+    )
+    if skipped_assistant_tool_call_turns > 0:
+        log_warning(
+            f"Skipped {skipped_assistant_tool_call_turns} individual assistant tool call turns due to JSON parsing errors within otherwise valid examples."
+        )
+
+    log_info(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
     log_info(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.tokenizer_name_or_path, trust_remote_code=True
