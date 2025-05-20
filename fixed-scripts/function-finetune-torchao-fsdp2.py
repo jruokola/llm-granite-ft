@@ -21,7 +21,12 @@ from contextlib import nullcontext
 # ─────────────────────── 3rd-party deps ────────────────────
 import torch
 import torch.distributed as dist
-from datasets import load_from_disk
+from datasets import (  # Added Features, Sequence, Value
+    Features,
+    Sequence,
+    Value,
+    load_from_disk,
+)
 from peft import (
     LoraConfig,
     TaskType,
@@ -662,7 +667,18 @@ else:
     )
     print_rank0_info("Using DDP instead of FSDP.")
 
-ds = load_from_disk(args.processed_dataset_path)
+# Define the expected features, matching generate_granite_fc_examples.py
+expected_features = Features(
+    {
+        "input_ids": Sequence(feature=Value(dtype="int32"), length=-1),
+        "attention_mask": Sequence(feature=Value(dtype="int8"), length=-1),
+        "labels": Sequence(feature=Value(dtype="int64"), length=-1),
+    }
+)
+print_rank0_info(
+    f"Loading dataset from {args.processed_dataset_path} with explicit features."
+)
+ds = load_from_disk(args.processed_dataset_path, features=expected_features)
 cut_idx = int(0.9 * len(ds))
 train_indices = list(range(cut_idx))
 val_indices = list(range(cut_idx, len(ds)))

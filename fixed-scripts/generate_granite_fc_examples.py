@@ -2,9 +2,10 @@ import argparse
 import json
 import os
 import random
+import shutil  # Added for directory operations
 import sys  # Re-add sys import
 
-from datasets import Dataset, Features, Sequence, Value
+from datasets import Dataset, DatasetInfo, Features, Sequence, Value
 from transformers import AutoTokenizer
 
 # --- Granite Specific Tokens & Roles (consistent with other scripts) ---
@@ -380,5 +381,107 @@ if __name__ == "__main__":
             f"Error: {dataset_info_path} not found after saving dataset. Cannot apply fix for 'length' field."
         )
     # --- End of post-processing ---
+
+    # --- Attempt to fix Arrow metadata by reloading with patched info and re-saving ---
+    log_info(
+        f"Attempting to fix Arrow metadata in {script_args.output_path} by reloading and re-saving..."
+    )
+    try:
+        # Load the dataset. This will use the patched dataset_info.json.
+        dataset_loaded_after_patch = Dataset.load_from_disk(script_args.output_path)
+        log_info(
+            f"Successfully reloaded dataset from {script_args.output_path} after patching dataset_info.json."
+        )
+        log_info(
+            f"Features from reloaded dataset (before cast): {dataset_loaded_after_patch.features}"
+        )
+
+        # Explicitly cast to the correct 'features' object (defined in the main script scope)
+        # This ensures the in-memory representation is correct before re-saving.
+        log_info(f"Casting reloaded dataset to known correct features: {features}")
+        dataset_for_resave = dataset_loaded_after_patch.cast(features)
+        log_info(
+            f"Features from dataset after cast (pre-info update): {dataset_for_resave.features}"
+        )
+
+        # Explicitly update the .info.features attribute of the dataset to be re-saved
+        if dataset_for_resave.info is not None:
+            dataset_for_resave.info.features = features
+            log_info(
+                "Updated dataset_for_resave.info.features with known correct features."
+            )
+        else:
+            # This case is less likely for a loaded dataset but handle defensively
+            log_info(
+                "dataset_for_resave.info was None, creating new DatasetInfo object."
+            )
+            # from datasets import DatasetInfo # Ensure DatasetInfo is imported (already handled at top of file)
+            dataset_for_resave.info = DatasetInfo(features=features)
+
+        log_info(
+            f"Features from dataset after cast and info update (to be re-saved): {dataset_for_resave.features}"
+        )
+        if dataset_for_resave.info:
+            log_info(
+                f"DatasetInfo.features after cast and info update: {dataset_for_resave.info.features}"
+            )
+
+        # Create a temporary directory for the re-save
+        temp_resave_path = script_args.output_path + "__resaved_temp"
+        if os.path.exists(temp_resave_path):
+            shutil.rmtree(
+                temp_resave_path
+            )  # Clean up if exists from a previous failed run
+        os.makedirs(temp_resave_path, exist_ok=True)
+
+        log_info(f"Re-saving dataset to temporary path: {temp_resave_path}")
+        dataset_for_resave.save_to_disk(temp_resave_path)
+        log_info(
+            f"Dataset re-saved to {temp_resave_path}. Now replacing original files."
+        )
+
+        # Replace original files with the re-saved ones.
+        # This ensures the main script uses the dataset with potentially fixed Arrow metadata.
+        original_data_files = [
+            f
+            for f in os.listdir(script_args.output_path)
+            if os.path.isfile(os.path.join(script_args.output_path, f))
+        ]
+
+        for item_name in os.listdir(temp_resave_path):
+            source_item_path = os.path.join(temp_resave_path, item_name)
+            destination_item_path = os.path.join(script_args.output_path, item_name)
+
+            if os.path.isfile(source_item_path):
+                if os.path.exists(destination_item_path) and os.path.isdir(
+                    destination_item_path
+                ):
+                    shutil.rmtree(
+                        destination_item_path
+                    )  # Remove directory if it's in the way of a file
+                elif os.path.exists(destination_item_path) and os.path.isfile(
+                    destination_item_path
+                ):
+                    os.remove(destination_item_path)  # Remove file if it's in the way
+                shutil.copy2(source_item_path, destination_item_path)
+            # Note: save_to_disk typically doesn't create subdirectories for simple datasets.
+            # If it did, shutil.copytree would be needed for directories.
+
+        # Remove any original files that are not in the re-saved version (e.g. old .arrow files if naming changed)
+        # This is a bit risky if save_to_disk changes file naming conventions, but usually, it's consistent.
+        # For now, let's assume direct replacement of dataset_info.json, state.json, and the .arrow file(s) is sufficient.
+        # A more robust cleanup might be needed if save_to_disk produces a different set of files.
+
+        shutil.rmtree(temp_resave_path)  # Clean up temporary directory
+        log_info(
+            f"Original dataset at {script_args.output_path} updated with re-saved version. Arrow metadata should now be fixed."
+        )
+
+    except Exception as e:
+        log_error(f"Error during Arrow metadata fix attempt (reload and re-save): {e}")
+        log_error(
+            f"The dataset at {script_args.output_path} might still have problematic Arrow metadata."
+        )
+    # --- End of Arrow metadata fix attempt ---
 
     log_info("--- Synthetic Dataset Generation Complete ---")
