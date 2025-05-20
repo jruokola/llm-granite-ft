@@ -58,6 +58,10 @@ try:
         force_recompute_fp8_weight_in_bwd,
         precompute_float8_dynamic_scale_for_fsdp,
     )
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig,
+        Float8WeightOnlyConfig,
+    )
     from torchao.utils import TORCH_VERSION_AT_LEAST_2_5, apply_logging_config
 
     TORCHAO_OK = True
