@@ -253,3 +253,45 @@ Ensure the paths to the sbatch scripts are correct.
 * **`ModuleNotFoundError`:** Ensure the respective Dockerfile (`Dockerfile.chess` or `Dockerfile.function`) installs all required Python packages. Check `PYTHONPATH` if necessary, although direct script execution in `/workspace` (or `/workspace/fixed-scripts/`) should generally work if scripts and dependencies are correctly placed.
 * **CUDA Errors / `nvidia-smi` fails inside container:** Likely an issue with Pyxis/Enroot setup, host drivers, or Slurm GPU resource allocation (`gres.conf`, cgroups). Escalate to admin if basic checks fail.
 * **Node Failure:** As seen previously, check `slurmctld.log` via admin for hardware/daemon issues on the specific worker node.
+
+## LLM Fine-tuning Configuration Notes (Experimental)
+
+The following notes are based on experimental fine-tuning runs with Granite-3.3-2B-Instruct using QLoRA, LoRA, FSDP, DDP, AMP, and Transformer Engine FP8 on H100 GPUs. These are observations and may vary with different models, datasets, or hardware. Default learning rate (lr) was 6e-5 and batch size per device (bs) was as noted.
+
+**Working Configurations:**
+
+* **QLoRA + FSDP + AMP (BF16/FP16)**: Works well.
+  * Example: `lr: 6e-5, bs: 16`
+* **QLoRA + FSDP2 + AMP (BF16/FP16)**: Works well.
+  * Example: `lr: 6e-5, bs: 16`
+* **QLoRA + DDP + AMP (BF16/FP16)**: Works well.
+  * Example: `lr: 6e-5, bs: 16`
+* **QLoRA + FSDP + FP8 (Transformer Engine, AMP disabled)**: Works, but requires a smaller batch size.
+  * Example: `lr: 6e-5, bs: 2`
+* **QLoRA + DDP + FP8 (Transformer Engine, AMP disabled)**: Works, but requires a smaller batch size.
+  * Example: `lr: 6e-5, bs: 2`
+* **LoRA + FSDP + FP8 (Transformer Engine, AMP disabled)**: Works.
+  * Example: `lr: 6e-5, bs: 2`
+* **LoRA + DDP + FP8 (Transformer Engine, AMP disabled)**: Works.
+  * Example: `lr: 6e-5, bs: 2`
+* **LoRA + FSDP + AMP (BF16/FP16) + FP8 (Transformer Engine)**: Works. (Note: AMP here refers to the non-TE parts of the model; TE manages its own FP8 context).
+  * Example: `lr: 6e-5, bs: 2`
+
+**Configurations with Issues (Unstable/NaN Loss):**
+
+* **QLoRA + FSDP + AMP (BF16/FP16) + FP8 (Transformer Engine)**: Unstable, NaN loss.
+  * Tested with: `lr: 6e-5, bs: 16`
+  * *Note: This suggests potential conflicts when standard AMP is active alongside QLoRA and TE FP8 under FSDP.*
+* **QLoRA + DDP + AMP (BF16/FP16) + FP8 (Transformer Engine)**: Unstable, NaN loss.
+  * Tested with: `lr: 6e-5, bs: 16`
+  * *Note: Similar instability as with FSDP under this combined AMP + QLoRA + TE FP8 setup.*
+* **LoRA + DDP + AMP (BF16/FP16) + FP8 (Transformer Engine)**: Unstable, NaN loss.
+  * Tested with: `lr: 6e-5, bs: 2`
+  * *Note: Instability even without QLoRA when combining DDP, standard AMP, and TE FP8.*
+
+**Key Takeaways from Experiments:**
+
+* Combining standard PyTorch AMP (`torch.autocast`) with Transformer Engine's FP8 (`fp8_autocast`) seems to be a primary source of instability, especially with QLoRA.
+* When using Transformer Engine FP8, it's generally more stable to disable standard AMP (`--disable_amp`) and let TE manage its precision context. The surrounding operations would then run in FP32 (if AMP is disabled) or FP16 (if `--use_fp8` implicitly sets non-TE AMP to FP16, as in `function-finetune-fixed.py`).
+* QLoRA + FP8 (with AMP disabled) configurations required a significantly smaller batch size (2 vs. 16) to maintain stability compared to QLoRA + AMP (without FP8).
+* FSDP generally appears more stable or manageable with complex configurations (like LoRA+FP8+AMP) than DDP in these specific tests, though DDP with LoRA+FP8 (AMP disabled) worked.
