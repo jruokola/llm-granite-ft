@@ -151,6 +151,12 @@ def main():
         default=-1,
         help="Number of samples to process for testing (default: -1, process all).",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,  # Default to None, so we can use os.cpu_count() logic if not set
+        help="Number of worker processes for parallel processing. Defaults to half of CPU cores.",
+    )
     script_args = parser.parse_args()
 
     # System prompt (same as in generate_granite_fc_examples.py)
@@ -378,8 +384,14 @@ def main():
     # Determine num_proc. os.cpu_count() can be a good default.
     # Let's use a reasonable default, e.g., 4, or allow it to be configured.
     # For now, let's pick a sensible default or use a fraction of available CPUs.
-    num_cpus = os.cpu_count()
-    num_proc_to_use = max(1, num_cpus // 2 if num_cpus else 1)  # Use half CPUs, min 1
+    if script_args.num_workers is not None and script_args.num_workers > 0:
+        num_proc_to_use = script_args.num_workers
+    else:
+        num_cpus = os.cpu_count()
+        num_proc_to_use = max(
+            1, num_cpus // 2 if num_cpus else 1
+        )  # Default to half CPUs, min 1
+
     log_info(f"Using {num_proc_to_use} processes for mapping.")
 
     # Define features for the final dataset
