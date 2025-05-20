@@ -335,4 +335,50 @@ if __name__ == "__main__":
         f"Saving processed dataset with {len(hf_dataset)} examples to {script_args.output_path}..."
     )
     hf_dataset.save_to_disk(script_args.output_path)
+
+    # --- Post-process dataset_info.json to ensure 'length' is present for Sequence features ---
+    dataset_info_path = os.path.join(script_args.output_path, "dataset_info.json")
+    if os.path.exists(dataset_info_path):
+        log_info(
+            f"Checking and fixing {dataset_info_path} for missing 'length' in Sequence features..."
+        )
+        try:
+            with open(dataset_info_path, "r") as f:
+                dataset_info_content = json.load(f)
+
+            modified = False
+            if "features" in dataset_info_content:
+                for feature_name, feature_def in dataset_info_content[
+                    "features"
+                ].items():
+                    if (
+                        isinstance(feature_def, dict)
+                        and feature_def.get("_type") == "Sequence"
+                    ):
+                        if "length" not in feature_def:
+                            log_info(
+                                f"Adding missing 'length': -1 to Sequence feature '{feature_name}' in {dataset_info_path}"
+                            )
+                            feature_def["length"] = -1
+                            modified = True
+
+            if modified:
+                with open(dataset_info_path, "w") as f:
+                    json.dump(dataset_info_content, f, indent=2)
+                log_info(
+                    f"Successfully updated {dataset_info_path} with missing 'length' fields."
+                )
+            else:
+                log_info(
+                    f"{dataset_info_path} already compliant or no Sequence features found needing 'length'."
+                )
+
+        except Exception as e:
+            log_error(f"Error processing {dataset_info_path}: {e}")
+    else:
+        log_error(
+            f"Error: {dataset_info_path} not found after saving dataset. Cannot apply fix for 'length' field."
+        )
+    # --- End of post-processing ---
+
     log_info("--- Synthetic Dataset Generation Complete ---")
