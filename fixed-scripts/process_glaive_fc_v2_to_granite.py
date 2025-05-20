@@ -107,8 +107,8 @@ def create_labels_for_granite_sequence(input_ids_list, tokenizer):
     return labels
 
 
-# Keep track of stats globally for the generator
-stats = {
+# Global stats dictionary for the generator
+processing_stats = {
     "skipped_assistant_tool_call_turns": 0,
     "successfully_formatted_examples_count": 0,
     "skipped_examples_count": 0,
@@ -118,10 +118,11 @@ stats = {
 def _generate_processed_examples(
     source_dataset_iterable, tokenizer_obj, script_args_obj, system_prompt_str
 ):
-    global stats  # Use global stats object
-    stats["skipped_assistant_tool_call_turns"] = 0
-    stats["successfully_formatted_examples_count"] = 0
-    stats["skipped_examples_count"] = 0
+    global processing_stats
+    # Reset stats for each run of the generator
+    processing_stats["skipped_assistant_tool_call_turns"] = 0
+    processing_stats["successfully_formatted_examples_count"] = 0
+    processing_stats["skipped_examples_count"] = 0
 
     for i, raw_example in enumerate(source_dataset_iterable):
         if i % 1000 == 0 and i > 0:
@@ -190,10 +191,8 @@ def _generate_processed_examples(
             )
             current_example_had_issues = True
 
-        if (
-            current_example_had_issues
-        ):  # If chat is empty or yields no turns, skip example
-            stats["skipped_examples_count"] += 1
+        if current_example_had_issues:
+            processing_stats["skipped_examples_count"] += 1
             continue
 
         for turn_raw in turns_raw:
@@ -223,7 +222,7 @@ def _generate_processed_examples(
                         log_error(
                             f"Failed to parse function call JSON in example {i} (ASSISTANT turn with tool_call skipped): {fc_json_str}. Error: {e}"
                         )
-                        stats["skipped_assistant_tool_call_turns"] += 1
+                        processing_stats["skipped_assistant_tool_call_turns"] += 1
                 else:
                     example_parts.append(
                         format_granite_turn(ROLE_ASSISTANT_GRANITE, content_part)
@@ -250,7 +249,7 @@ def _generate_processed_examples(
         attention_mask = encodings["attention_mask"]
         labels = create_labels_for_granite_sequence(input_ids, tokenizer_obj)
 
-        stats["successfully_formatted_examples_count"] += 1
+        processing_stats["successfully_formatted_examples_count"] += 1
         yield {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -298,7 +297,6 @@ def main():
         default=-1,
         help="Number of samples to process for testing (default: -1, process all).",
     )
-    # --num_workers is not used by Dataset.from_generator directly, but kept for potential future mpire re-integration inside generator
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -313,25 +311,37 @@ def main():
         f"Loading source dataset: {script_args.hf_dataset_name}, split: {script_args.hf_dataset_split}"
     )
     try:
-        # Consider stream=True for very large datasets if supported and beneficial
         source_dataset = load_dataset(
-            script_args.hf_dataset_name, split=script_args.hf_dataset_split
+            script_args.hf_dataset_name,
+            split=script_args.hf_dataset_split,
+            streaming=False,
         )
     except Exception as e:
         log_error(f"Failed to load dataset {script_args.hf_dataset_name}: {e}")
         sys.exit(1)
-    log_info(f"Loaded {len(source_dataset)} examples from source.")
+    log_info(
+        f"Loaded {len(source_dataset)} examples from source."
+    )  # This will work if streaming=False
 
+    source_dataset_iterable = source_dataset
     if script_args.num_test_samples > 0:
         log_info(
             f"Processing only the first {script_args.num_test_samples} samples for testing."
         )
-        source_dataset_iterable = source_dataset.select(
-            range(min(script_args.num_test_samples, len(source_dataset)))
+        # For iterable datasets (streaming=True), .select() doesn't work. We'd use islice.
+        # However, since we need len() above and for progress, load non-streamed first.
+        # If it was streamed: from itertools import islice; source_dataset_iterable = islice(source_dataset, script_args.num_test_samples)
+        # But then len(source_dataset_iterable) wouldn't work.
+        # For now, assuming non-streaming load is acceptable. If dataset is too big for memory, streaming + different progress indication is needed.
+        actual_num_to_select = min(script_args.num_test_samples, len(source_dataset))
+        source_dataset_iterable = source_dataset.select(range(actual_num_to_select))
+        log_info(
+            f"Effective number of samples to process: {len(source_dataset_iterable)}"
         )
     else:
-        source_dataset_iterable = source_dataset
-    log_info(f"Effective number of samples to process: {len(source_dataset_iterable)}")
+        log_info(
+            f"Effective number of samples to process: {len(source_dataset_iterable)}"
+        )
 
     log_info(f"Loading tokenizer: {script_args.tokenizer_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -356,7 +366,6 @@ def main():
     )
 
     log_info("Processing data using Dataset.from_generator...")
-    # Pass necessary objects to the generator via gen_kwargs
     gen_kwargs = {
         "source_dataset_iterable": source_dataset_iterable,
         "tokenizer_obj": tokenizer,
@@ -367,15 +376,16 @@ def main():
         _generate_processed_examples, features=final_features, gen_kwargs=gen_kwargs
     )
 
+    # Log final stats from the global dict
     log_info(
-        f"Successfully formatted {stats['successfully_formatted_examples_count']} examples."
+        f"Successfully formatted {processing_stats['successfully_formatted_examples_count']} examples."
     )
     log_info(
-        f"Skipped {stats['skipped_examples_count']} entire examples due to critical parsing issues."
+        f"Skipped {processing_stats['skipped_examples_count']} entire examples due to critical parsing issues."
     )
-    if stats["skipped_assistant_tool_call_turns"] > 0:
+    if processing_stats["skipped_assistant_tool_call_turns"] > 0:
         log_warning(
-            f"Skipped {stats['skipped_assistant_tool_call_turns']} individual assistant tool call turns due to JSON parsing errors."
+            f"Skipped {processing_stats['skipped_assistant_tool_call_turns']} individual assistant tool call turns due to JSON parsing errors."
         )
 
     log_info(
