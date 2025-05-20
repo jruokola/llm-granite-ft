@@ -130,7 +130,7 @@ def main():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=2048,  # Defaulting to a more common length for function calling
+        default=512,  # Matching generate_granite_fc_examples.py for format consistency check
         help="Maximum sequence length for tokenization.",
     )
     parser.add_argument(
@@ -169,97 +169,118 @@ def main():
             log_info(f"Processing example {i}...")
 
         example_parts = []
-        # 1. System Turn
+
+        # 1. System Turn (predefined, same for all examples from this script)
         example_parts.append(format_granite_turn(ROLE_SYSTEM_GRANITE, system_prompt))
 
         # 2. Available Tools Turn
-        # The 'functions' field in glaive_fc_v2 is already a JSON string of the tools list.
-        # It might be a string representation of a list of tool JSONs.
-        # The Granite format expects the content of ROLE_AVAILABLE_TOOLS_GRANITE to be the JSON string of the tools list.
-        available_tools_content = raw_example.get(
-            "functions", "[]"
-        )  # Default to empty list if not present
+        # In glaiveai/glaive-function-calling-v2, tools are in the 'system' field.
+        # Example: "SYSTEM: You are a helpful assistant with access to the following functions. Use them if required - {json_func_def_1} {json_func_def_2}"
+        # We need to extract these JSON function definitions.
+        system_field_content = raw_example.get("system", "")
+        tools_marker = "Use them if required - "
+        tools_json_str = "[]"  # Default to empty list of tools
+        if tools_marker in system_field_content:
+            potential_tools_part = system_field_content.split(tools_marker, 1)[
+                -1
+            ].strip()
+            # The functions are concatenated JSON objects, not a single JSON list.
+            # We need to parse them individually and then wrap them in a list.
+            extracted_tools = []
+            decoder = json.JSONDecoder()
+            idx = 0
+            while idx < len(potential_tools_part):
+                potential_tools_part = potential_tools_part[idx:].strip()
+                if not potential_tools_part:
+                    break
+                try:
+                    func, end_idx = decoder.raw_decode(potential_tools_part)
+                    extracted_tools.append(func)
+                    idx = end_idx
+                except json.JSONDecodeError:
+                    # This might happen if there's non-JSON text after the functions
+                    # or if the concatenation isn't perfect.
+                    log_warning(
+                        f"Could not parse all function JSONs in example {i} from: {potential_tools_part[idx : idx + 50]}..."
+                    )
+                    break
+            if extracted_tools:
+                tools_json_str = json.dumps(extracted_tools)
+
         example_parts.append(
-            format_granite_turn(ROLE_AVAILABLE_TOOLS_GRANITE, available_tools_content)
+            format_granite_turn(ROLE_AVAILABLE_TOOLS_GRANITE, tools_json_str)
         )
 
-        # 3. Conversation Turns
-        conversation = raw_example.get("conversation", [])
-        if not isinstance(conversation, list):
-            log_error(
-                f"Skipping example {i} due to invalid conversation format: {conversation}"
-            )
-            continue
+        # 3. Conversation Turns from 'chat' field
+        # Example 'chat': "USER: ... ASSISTANT: ... <|endoftext|> FUNCTION RESPONSE: ... ASSISTANT: ... <|endoftext|>"
+        chat_content = raw_example.get("chat", "")
+        turns_raw = chat_content.split("<|endoftext|>")
 
-        for turn in conversation:
-            role = turn.get("role")
-            content = turn.get("content")
-            function_call_str = turn.get(
-                "function_call"
-            )  # This is a string in glaive_fc_v2
+        for turn_raw in turns_raw:
+            turn_raw = turn_raw.strip()
+            if not turn_raw:
+                continue
 
-            if role == "user":
-                example_parts.append(
-                    format_granite_turn(ROLE_USER_GRANITE, content if content else "")
-                )
-            elif role == "assistant":
-                if function_call_str:
-                    # The function_call_str from glaive_fc_v2 is already the JSON string of the tool call list
-                    # e.g., "[{\"arguments\": ..., \"name\": ...}]"
-                    # Granite format: <|tool_call|>JSON_TOOL_CALL_LIST
-                    assistant_response_content = (
-                        f"{TOOL_CALL_MARKER_GRANITE}{function_call_str}"
-                    )
-                    example_parts.append(
-                        format_granite_turn(
-                            ROLE_ASSISTANT_GRANITE, assistant_response_content
+            if turn_raw.startswith("USER:"):
+                content = turn_raw[len("USER:") :].strip()
+                example_parts.append(format_granite_turn(ROLE_USER_GRANITE, content))
+            elif turn_raw.startswith("ASSISTANT:"):
+                content_part = turn_raw[len("ASSISTANT:") :].strip()
+                if content_part.startswith("<functioncall>"):
+                    # Extract JSON from <functioncall> {"name": "...", "arguments": '...'}
+                    # The arguments themselves are a string that needs to be parsed if we were to use them,
+                    # but for Granite format, we just need the whole function call object string.
+                    # The official dataset has the arguments as a string, not a nested JSON object directly.
+                    # e.g. <functioncall> {"name": "get_news_headlines", "arguments": '{"country": "United States"}'}
+                    # The Granite format expects the <|tool_call|> marker followed by a JSON *list* of tool calls.
+                    # The glaive format provides a single tool call object as a string.
+
+                    fc_marker_start = "<functioncall>"
+                    # The end of the function call is implicitly before <|endoftext|> or end of string
+                    # For simplicity, assume the function call is the entirety of the content_part after the marker
+
+                    fc_json_str = content_part[len(fc_marker_start) :].strip()
+
+                    # The fc_json_str is like: {"name": "N", "arguments": '{"K":"V"}'}
+                    # Granite expects: [{"name": "N", "arguments": "{\"K\":\"V\""}] (a list of such objects, stringified)
+                    # So, we need to wrap fc_json_str in list brackets to make it a JSON array string.
+                    # However, the arguments within the glaive format are already a string.
+                    # Let's parse it to ensure it's valid JSON, then re-stringify it as a list item.
+                    try:
+                        # Attempt to parse the function call string to validate it's a single JSON object
+                        # The arguments field is a string, which is fine for the Granite format if the outer structure is a list of calls.
+                        parsed_fc = json.loads(fc_json_str)  # This should be a dict
+                        # Wrap it as a list containing one item, then dump to string
+                        granite_fc_list_str = json.dumps([parsed_fc])
+                        assistant_response_content = (
+                            f"{TOOL_CALL_MARKER_GRANITE}{granite_fc_list_str}"
                         )
-                    )
+                        example_parts.append(
+                            format_granite_turn(
+                                ROLE_ASSISTANT_GRANITE, assistant_response_content
+                            )
+                        )
+                    except json.JSONDecodeError:
+                        log_error(
+                            f"Failed to parse function call JSON in example {i}: {fc_json_str}. Using raw content part."
+                        )
+                        example_parts.append(
+                            format_granite_turn(ROLE_ASSISTANT_GRANITE, content_part)
+                        )  # Fallback
                 else:
                     example_parts.append(
-                        format_granite_turn(
-                            ROLE_ASSISTANT_GRANITE, content if content else ""
-                        )
+                        format_granite_turn(ROLE_ASSISTANT_GRANITE, content_part)
                     )
-            elif (
-                role == "function"
-            ):  # This is ROLE_TOOL_RESPONSE_GRANITE in our target format
-                # Content for 'function' role in glaive_fc_v2 is a string representation of a list containing a single JSON string.
-                # e.g., "[\"{\\\"median\\\": 5}\"]"
-                # We need to extract the inner JSON string.
-                try:
-                    # First, parse the outer list string:
-                    tool_output_list_parsed = json.loads(content)
-                    if (
-                        isinstance(tool_output_list_parsed, list)
-                        and len(tool_output_list_parsed) > 0
-                    ):
-                        actual_tool_output_str = tool_output_list_parsed[0]
-                        example_parts.append(
-                            format_granite_turn(
-                                ROLE_TOOL_RESPONSE_GRANITE, actual_tool_output_str
-                            )
-                        )
-                    else:
-                        log_error(
-                            f"Unexpected format for function role content in example {i}: {content}. Using raw content."
-                        )
-                        example_parts.append(
-                            format_granite_turn(
-                                ROLE_TOOL_RESPONSE_GRANITE, content if content else ""
-                            )
-                        )
-                except json.JSONDecodeError:
-                    log_error(
-                        f"JSONDecodeError for function role content in example {i}: {content}. Using raw content."
-                    )
-                    example_parts.append(
-                        format_granite_turn(
-                            ROLE_TOOL_RESPONSE_GRANITE, content if content else ""
-                        )
-                    )
+            elif turn_raw.startswith("FUNCTION RESPONSE:"):
+                content = turn_raw[len("FUNCTION RESPONSE:") :].strip()
+                # Content is already the JSON string of the tool output.
+                example_parts.append(
+                    format_granite_turn(ROLE_TOOL_RESPONSE_GRANITE, content)
+                )
             else:
-                log_warning(f"Unknown role '{role}' in example {i}. Skipping turn.")
+                log_warning(
+                    f"Unrecognized turn structure in example {i}: {turn_raw[:100]}..."
+                )
 
         formatted_text_examples.append("".join(example_parts))
 
@@ -283,39 +304,41 @@ def main():
             # if this tokenizer is used for a model that didn't originally have it.
             # This script only processes data; model adjustments are for training scripts.
 
-    all_input_ids = []
-    all_attention_masks = []
-    all_labels = []
+    log_info("Creating intermediate dataset from formatted text examples...")
+    # Create a temporary dataset with just the formatted text
+    temp_data = {"text": formatted_text_examples}
+    temp_dataset = Dataset.from_dict(temp_data)
 
-    log_info("Tokenizing and creating labels for formatted examples...")
-    for i, text_content in enumerate(formatted_text_examples):
-        if i % 1000 == 0 and i > 0:
-            log_info(f"Tokenizing example {i}...")
-        if i < 2:  # Print first 2 formatted texts for verification
-            log_info(f"\n--- Formatted Example {i + 1} Text (to be tokenized) ---")
-            log_info(
-                text_content[:1000] + "..."
-                if len(text_content) > 1000
-                else text_content
-            )
+    log_info("Tokenizing and creating labels in parallel using Dataset.map()...")
 
-        encodings = tokenizer(
-            text_content,
+    def tokenize_and_label_batch(examples):
+        # Tokenize the batch of text examples
+        batch_encodings = tokenizer(
+            examples["text"],
             max_length=script_args.max_seq_length,
             truncation=True,
-            padding="max_length",
+            padding="max_length",  # Padding will be applied per batch
             return_attention_mask=True,
         )
-        input_ids = encodings["input_ids"]
-        attention_mask = encodings["attention_mask"]
-        labels = create_labels_for_granite_sequence(input_ids, tokenizer)
 
-        all_input_ids.append(input_ids)
-        all_attention_masks.append(attention_mask)
-        all_labels.append(labels)
+        batch_labels = []
+        for i in range(len(batch_encodings["input_ids"])):
+            input_ids = batch_encodings["input_ids"][i]
+            labels = create_labels_for_granite_sequence(input_ids, tokenizer)
+            batch_labels.append(labels)
 
-    # Define features for the dataset (consistent with generate_granite_fc_examples.py)
-    features = Features(
+        batch_encodings["labels"] = batch_labels
+        return batch_encodings
+
+    # Determine num_proc. os.cpu_count() can be a good default.
+    # Let's use a reasonable default, e.g., 4, or allow it to be configured.
+    # For now, let's pick a sensible default or use a fraction of available CPUs.
+    num_cpus = os.cpu_count()
+    num_proc_to_use = max(1, num_cpus // 2 if num_cpus else 1)  # Use half CPUs, min 1
+    log_info(f"Using {num_proc_to_use} processes for mapping.")
+
+    # Define features for the final dataset
+    final_features = Features(
         {
             "input_ids": Sequence(feature=Value(dtype="int32"), length=-1),
             "attention_mask": Sequence(feature=Value(dtype="int8"), length=-1),
@@ -323,14 +346,28 @@ def main():
         }
     )
 
-    hf_dataset = Dataset.from_dict(
-        {
-            "input_ids": all_input_ids,
-            "attention_mask": all_attention_masks,
-            "labels": all_labels,
-        },
-        features=features,
+    # Apply the mapping function
+    # The `map` function will return a new Dataset with the added columns.
+    # We need to ensure the output features are correctly specified if `map` doesn't infer them perfectly,
+    # or cast them afterwards. However, returning a dict usually works well.
+    processed_dataset = temp_dataset.map(
+        tokenize_and_label_batch,
+        batched=True,
+        num_proc=num_proc_to_use,
+        remove_columns=["text"],  # Remove the original text column
+        features=final_features,  # Explicitly set features for the output dataset
+        desc="Tokenizing and labeling",
     )
+
+    # Ensure the features are set correctly on the final dataset object
+    # This might be redundant if `features` arg in `map` works as expected, but good for safety.
+    if processed_dataset.features is None or set(
+        processed_dataset.features.keys()
+    ) != set(final_features.keys()):
+        log_info(f"Casting dataset to final features: {final_features}")
+        hf_dataset = processed_dataset.cast(final_features)
+    else:
+        hf_dataset = processed_dataset
 
     log_info(
         f"Saving processed dataset with {len(hf_dataset)} examples to {script_args.output_path}..."
@@ -391,14 +428,18 @@ def main():
             f"Features from reloaded dataset (before cast): {dataset_loaded_after_patch.features}"
         )
 
-        log_info(f"Casting reloaded dataset to known correct features: {features}")
-        dataset_for_resave = dataset_loaded_after_patch.cast(features)
+        log_info(
+            f"Casting reloaded dataset to known correct features: {final_features}"
+        )  # Use final_features
+        dataset_for_resave = dataset_loaded_after_patch.cast(
+            final_features
+        )  # Use final_features
         log_info(
             f"Features from dataset after cast (pre-info update): {dataset_for_resave.features}"
         )
 
         if dataset_for_resave.info is not None:
-            dataset_for_resave.info.features = features
+            dataset_for_resave.info.features = final_features  # Use final_features
             log_info(
                 "Updated dataset_for_resave.info.features with known correct features."
             )
@@ -406,7 +447,9 @@ def main():
             log_info(
                 "dataset_for_resave.info was None, creating new DatasetInfo object."
             )
-            dataset_for_resave.info = DatasetInfo(features=features)
+            dataset_for_resave.info = DatasetInfo(
+                features=final_features
+            )  # Use final_features
 
         log_info(
             f"Features from dataset after cast and info update (to be re-saved): {dataset_for_resave.features}"
