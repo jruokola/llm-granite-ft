@@ -136,7 +136,7 @@ def main():
     parser.add_argument(
         "--hf_dataset_name",
         type=str,
-        default="hqfx/glaive_fc_v2",
+        default="glaiveai/glaive-function-calling-v2",
         help="Hugging Face dataset name.",
     )
     parser.add_argument(
