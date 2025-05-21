@@ -35,8 +35,8 @@ RUN python3 -m pip install --upgrade pip setuptools wheel && \
 # 3 — Copy training code and data
 # Copy the new FSDP2 + torchao script
 COPY fixed-scripts/function-finetune-torchao-fsdp2.py .
-# Assuming the same dataset path is used
-COPY ./glaive_fc_v2 /processed_datasets/glaive_fc_v2/
+# Dataset is loaded from shared filesystem at /glaive_fc_v2; no in-image copy needed
+# Expect dataset to be mounted at /glaive_fc_v2 on shared filesystem; do not copy into image
 
 # 4 — No CMD: Invoke with torchrun / sbatch
 # Example for running (adjust as needed):

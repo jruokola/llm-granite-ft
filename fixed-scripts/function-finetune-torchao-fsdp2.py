@@ -50,17 +50,12 @@ from transformers import (
 # FP8 with torchao
 try:
     import torchao
-    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-
-    # Removed: from torchao.float8.config import Float8Recipe
-    from torchao.float8.fsdp import (
+    from torchao.float8 import (
+        Float8LinearConfig,
+        convert_to_float8_training,
         enable_fsdp_float8_all_gather,
         force_recompute_fp8_weight_in_bwd,
         precompute_float8_dynamic_scale_for_fsdp,
-    )
-    from torchao.quantization import (
-        Float8DynamicActivationFloat8WeightConfig,
-        Float8WeightOnlyConfig,
     )
     from torchao.utils import TORCH_VERSION_AT_LEAST_2_5, apply_logging_config
 
@@ -128,7 +123,11 @@ cli.add_argument(
 
 # model / data
 cli.add_argument("--model_name_or_path", default="ibm-granite/granite-3.3-2b-instruct")
-cli.add_argument("--processed_dataset_path", required=True)
+cli.add_argument(
+    "--processed_dataset_path",
+    default="/glaive_fc_v2",
+    help="Path to processed dataset on shared filesystem",
+)
 cli.add_argument("--output_dir", default="./checkpoints")
 # LoRA / QLoRA
 cli.add_argument("--use_qlora", action="store_true")
