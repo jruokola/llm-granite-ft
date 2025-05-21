@@ -14,11 +14,12 @@ import torch
 # from torch.nn.parallel import DistributedDataParallel as DDP
 # from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from datasets import load_from_disk  # Added load_from_disk
+from peft import LoraConfig, get_peft_model
 from torch.amp import GradScaler  # Will be made conditional or adapted
 from torch.utils.data import DataLoader, Dataset
 
 # Removed: from torch.utils.data.distributed import DistributedSampler # Not needed for single process
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Parse command line arguments
 parser = argparse.ArgumentParser()
@@ -40,7 +41,7 @@ parser.add_argument(
     default=8,
     help="Gradient accumulation steps",
 )
-parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning Rate")
+parser.add_argument("--learning_rate", type=float, default=6e-5, help="Learning Rate")
 parser.add_argument(
     "--max_training_steps", type=int, default=-1, help="Interrupt training early."
 )
@@ -121,7 +122,13 @@ logger = logging.getLogger(__name__)  # Define logger earlier
 
 if torch.backends.mps.is_available():
     device = torch.device("mps")
-    # torch.mps.empty_cache() # Good practice for MPS
+    logger.info("Using MPS device for training (speed enabled)")
+    # Gradient checkpointing/backward on MPS is unsupported
+    if args.gradient_checkpointing:
+        logger.warning(
+            "Disabling gradient_checkpointing on MPS due to backward limitation"
+        )
+        args.gradient_checkpointing = False
 else:
     device = torch.device("cpu")
     logger.info("MPS not available, defaulting to CPU. Training might be very slow.")
@@ -380,7 +387,12 @@ def train(model, train_dataset, eval_dataset, args):
 
     model.train()
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        if device.type != "mps":
+            model.gradient_checkpointing_enable()
+        else:
+            logger.warning(
+                "Gradient checkpointing skipped on MPS: backward not supported with checkpointing"
+            )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     num_update_steps_per_epoch = math.ceil(
@@ -413,7 +425,7 @@ def train(model, train_dataset, eval_dataset, args):
     global_step, total_loss, epoch_loss = 0, 0, 0
     best_eval_loss = float("inf")
     start_time = time.time()
-    log_interval = 1  # Changed for more frequent logging
+    log_interval = 100  # Changed for more frequent logging
 
     logger.info(
         f"Starting training for {args.num_epochs} epochs ({max_train_steps} steps)"
@@ -556,18 +568,16 @@ if __name__ == "__main__":
 
     # --- Main Execution ---
     logger.info(f"Loading tokenizer and model from: {args.model_name_or_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
-    )
 
     model_dtype = torch.bfloat16
     if args.disable_amp:
         model_dtype = torch.float32
-    elif device.type == "mps" and not mps_check_bf16_support():
-        logger.info(
-            "MPS device detected, bfloat16 not supported by this device/PyTorch version. Using float16 for model loading if AMP enabled."
+    elif device.type == "mps":
+        logger.warning(
+            "MPS device detected: half precision/backward unsupported. Using float32 and disabling AMP."
         )
-        model_dtype = torch.float16
+        model_dtype = torch.float32
+        args.disable_amp = True
     elif (
         device.type == "cpu" and not args.disable_amp
     ):  # Ensure bfloat16 is attempted on CPU if AMP not disabled
@@ -575,14 +585,52 @@ if __name__ == "__main__":
             "CPU device detected. Using bfloat16 for model loading if AMP enabled (requires PyTorch 1.10+ for CPU AMP)."
         )
         # model_dtype remains torch.bfloat16 as per initial assignment
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        cache_dir=".cache",
-        torch_dtype=model_dtype,
-        trust_remote_code=True,
+    # QLoRA: configure 4-bit quantization
+    config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=model_dtype,
     )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path, cache_dir=".cache", trust_remote_code=True
+    )
+
+    if torch.cuda.is_available():
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            cache_dir=".cache",
+            quantization_config=config,
+            torch_dtype=model_dtype,
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            cache_dir=".cache",
+            torch_dtype=model_dtype,
+            trust_remote_code=True,
+        )
+    # Disable cache if using gradient checkpointing for proper backward
+    if args.gradient_checkpointing:
+        model.config.use_cache = False
     model.to(device)
+    # LoRA: enable parameter-efficient fine-tuning
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    # Log trainable vs total params
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        f"Total params: {total_params:,}. Trainable LoRA params: {trainable_params:,} ({trainable_params / total_params:.4%})"
+    )
     logger.info(
         f"Tokenizer and model loaded. Model is on {model.device} with dtype {model.dtype}"
     )
